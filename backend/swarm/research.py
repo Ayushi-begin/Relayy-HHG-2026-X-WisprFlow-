@@ -1,0 +1,151 @@
+"""Research agent: gathers customer context with Claude Sonnet and read-only DB tools."""
+
+import datetime as dt
+import json
+from collections.abc import Callable
+
+from pydantic import BaseModel, ValidationError
+
+from swarm import llm, tools
+from swarm.state import ResearchResult, TicketState
+
+MODEL = llm.SMART_MODEL
+MAX_ITERATIONS = 6  # model calls per ticket
+
+SYSTEM_PROMPT = f"""\
+You are the research step of a customer-support system for Brightwave, a B2B SaaS analytics product. \
+A triage step has already classified the ticket. Your job is to gather the facts a later step needs \
+to decide how to resolve it. You do not reply to the customer and you do not recommend a resolution.
+
+{llm.UNTRUSTED_TICKET_RULE}
+
+Use the tools to check facts against Brightwave's records rather than trusting what the ticket claims:
+- Look up the customer first, so you know their plan, tier, and lifetime value.
+- For billing or refund issues, check their payments over a window that covers the charges mentioned.
+- Check past tickets for history that matters, such as repeat problems or earlier accommodations.
+- Search the help docs for the policy or how-to that applies, even when you feel confident: policies \
+(what is refundable, rate limits, timelines) may differ from general knowledge.
+Call several tools at once when they are independent. Stop as soon as you have what is needed.
+
+When you are done, reply with JSON matching the required schema. key_findings is 3 to 8 short, \
+factual bullets with concrete numbers and dates, for example "Charged $450.00 twice on Oct 27, 2026 \
+(payments 42 and 43)", "VIP (Enterprise), lifetime value $117,500", "Refund policy: duplicate charges \
+are always refunded in full". Note any mismatch between what the ticket claims and what the records \
+show. Do not include recommendations."""
+
+BUDGET_NOTE = (
+    "This is your last turn: do not call any more tools. Reply now with your key findings as JSON, "
+    "based on what you have gathered."
+)
+
+
+class ResearchNotes(BaseModel):
+    key_findings: list[str]
+
+
+NOTES_FORMAT = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {"key_findings": {"type": "array", "items": {"type": "string"}}},
+        "required": ["key_findings"],
+        "additionalProperties": False,
+    },
+}
+
+Emit = Callable[[str, str], None]  # (status, message)
+
+
+def _brief(state: TicketState) -> str:
+    t, tri = state.ticket, state.triage
+    lines = [
+        f"Today's date: {dt.date.today().isoformat()}",
+        f"Ticket id: {t.id}, received {t.created_at:%Y-%m-%d %H:%M} UTC",
+        f"Sender's customer id (from our system, trusted): {t.customer_id if t.customer_id is not None else 'unknown'}",
+    ]
+    if tri:
+        lines.append(
+            f"Triage: {tri.category}, {tri.urgency} urgency, {tri.sentiment}, language {tri.language}"
+            f"{', FLAGGED SUSPICIOUS' if tri.is_suspicious else ''}. Summary: {tri.summary}"
+        )
+    return "\n".join(lines) + "\n\n" + llm.ticket_block(t)
+
+
+def _parse_notes(response) -> list[str] | None:
+    text = next((b.text for b in reversed(response.content) if b.type == "text"), None)
+    if text is None:
+        return None
+    try:
+        return ResearchNotes.model_validate(json.loads(text)).key_findings
+    except (json.JSONDecodeError, ValidationError):
+        return None
+
+
+def _fallback_findings(ctx: tools.ToolContext) -> list[str]:
+    """Plain facts from the collected records, used when the model gives no findings."""
+    findings = []
+    if c := ctx.customer:
+        findings.append(f"{c.tier.upper()} customer on {c.plan}, lifetime value ${c.lifetime_value:,.2f}")
+    if ctx.payments:
+        dupes = tools.find_duplicates(list(ctx.payments.values()))
+        findings += [f"Possible duplicate charge: ${d['amount']:,.2f} on {d['date']} (payments {d['payment_ids']})" for d in dupes]
+    if ctx.past_tickets:
+        findings.append(f"{len(ctx.past_tickets)} past tickets on record")
+    return findings or ["No findings: research did not complete."]
+
+
+async def research(state: TicketState, emit: Emit) -> ResearchResult:
+    ctx = tools.ToolContext(allowed_customer_id=state.ticket.customer_id)
+    messages: list[dict] = [{"role": "user", "content": _brief(state)}]
+    findings: list[str] | None = None
+
+    for iteration in range(1, MAX_ITERATIONS + 1):
+        response = await llm.client().beta.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            output_config={"effort": "medium", "format": NOTES_FORMAT},
+            system=SYSTEM_PROMPT,
+            tools=tools.TOOLS,
+            messages=messages,
+            **llm.FALLBACK,
+        )
+        llm.record_usage(state.usage, "research", MODEL, response)
+        if response.stop_reason == "refusal":
+            emit("error", "Research model declined this ticket.")
+            break
+
+        # Pass the assistant turn back unchanged (thinking blocks included); history stays append-only.
+        messages.append({"role": "assistant", "content": response.content})
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
+        if not tool_uses:
+            findings = _parse_notes(response)
+            break
+        if iteration == MAX_ITERATIONS:
+            emit("tool", f"⏱️ Tool budget of {MAX_ITERATIONS} rounds used up; finishing with what was found.")
+            break
+
+        results = []
+        for call in tool_uses:
+            emit("tool", tools.describe_call(call.name, call.input))
+            output, is_error = tools.execute(ctx, call.name, call.input)
+            if is_error:
+                emit("tool", f"⚠️ {call.name}: {output}")
+            results.append({"type": "tool_result", "tool_use_id": call.id, "content": output, "is_error": is_error})
+        if iteration == MAX_ITERATIONS - 1:
+            results.append({"type": "text", "text": BUDGET_NOTE})
+        messages.append({"role": "user", "content": results})
+
+    # The policy step needs the tier even if the model never looked the customer up.
+    if ctx.customer is None and ctx.allowed_customer_id is not None:
+        try:
+            tools.lookup_customer(ctx, str(ctx.allowed_customer_id))
+        except tools.ToolError:
+            pass
+
+    return ResearchResult(
+        customer=ctx.customer,
+        payments=sorted(ctx.payments.values(), key=lambda p: p.date, reverse=True),
+        past_tickets=ctx.past_tickets,
+        relevant_docs=list(ctx.docs.values()),
+        key_findings=findings or _fallback_findings(ctx),
+    )

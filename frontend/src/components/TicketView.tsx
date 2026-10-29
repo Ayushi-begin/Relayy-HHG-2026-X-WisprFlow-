@@ -1,0 +1,323 @@
+import { AnimatePresence, motion } from 'framer-motion'
+import { useState } from 'react'
+import { api } from '../api'
+import type { ActionResult, ResearchResult, TicketDetail, TriageResult } from '../api'
+import { useTicketStream } from '../hooks/useTicketStream'
+import type { StreamedEvent } from '../hooks/useTicketStream'
+import { decisionMeta, money, ruleLabels, statusMeta, tierTone, timeAgo, toneClasses, urgencyMeta } from '../lib/format'
+import { phaseOf } from '../lib/phase'
+import type { FlowState } from '../lib/phase'
+import { AgentCard, FlowConnector } from './AgentCard'
+import { Badge, ConfidenceBar, LiveDot, Spinner } from './ui'
+
+const sentimentEmoji = { positive: '🙂', neutral: '😐', frustrated: '😣', angry: '😡' } as const
+
+export function TicketView({ ticketId }: { ticketId: number | null }) {
+  if (ticketId === null) {
+    return (
+      <div className="grid h-full place-items-center p-10 text-center">
+        <div>
+          <div className="mx-auto mb-4 grid size-14 place-items-center rounded-2xl bg-white/[0.04] text-2xl ring-1 ring-white/[0.08]">🛰️</div>
+          <p className="text-sm text-slate-300">Select a ticket to watch the agents work</p>
+          <p className="mt-1 text-xs text-slate-500">or fire one of the demo presets on the right</p>
+        </div>
+      </div>
+    )
+  }
+  return <TicketStreamView key={ticketId} ticketId={ticketId} />
+}
+
+function TicketStreamView({ ticketId }: { ticketId: number }) {
+  const { detail, events, status, connected, error } = useTicketStream(ticketId)
+
+  if (error && !detail) return <p className="p-8 text-sm text-rose-300">Couldn't load ticket #{ticketId}: {error}</p>
+  if (!detail) {
+    return (
+      <div className="grid h-full place-items-center text-slate-500">
+        <Spinner className="size-5" />
+      </div>
+    )
+  }
+
+  const byAgent = (agent: StreamedEvent['agent']) => events.filter((e) => e.agent === agent)
+  const triageEvents = byAgent('triage')
+  const researchEvents = byAgent('research')
+  const actionEvents = byAgent('action')
+  const phases = [phaseOf(triageEvents), phaseOf(researchEvents), phaseOf(actionEvents)]
+  const flow = (i: number): FlowState => (phases[i] === 'active' ? 'flowing' : phases[i] === 'idle' ? 'idle' : 'done')
+  const { triage, research, action } = detail.state
+  const currentStatus = status ?? detail.status
+  const finished = currentStatus !== 'processing' && phases[2] !== 'idle'
+
+  return (
+    <motion.div
+      key={ticketId}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+      className="mx-auto max-w-3xl px-1 pb-10"
+    >
+      <TicketHeader detail={detail} status={currentStatus} connected={connected} />
+
+      <FlowConnector state={phases[0] === 'idle' ? (currentStatus === 'processing' ? 'flowing' : 'idle') : 'done'} />
+      <AgentCard emoji="🧭" title="Triage" model="haiku-5.5" role="Classifies category, urgency, sentiment and manipulation risk" events={triageEvents}>
+        {triage && <TriageResults triage={triage} />}
+      </AgentCard>
+
+      <FlowConnector state={flow(1)} />
+      <AgentCard emoji="🔎" title="Research" model="sonnet-5.5" role="Checks customer records, payments, history and help docs" events={researchEvents}>
+        {research && <ResearchResults research={research} />}
+      </AgentCard>
+
+      <FlowConnector state={flow(2)} />
+      <AgentCard emoji="⚡" title="Action" model="sonnet-5.5 + policy" role="Proposes a resolution; Python guardrails have the final say" events={actionEvents}>
+        {action && <ActionResults action={action} />}
+      </AgentCard>
+
+      <FlowConnector state={finished ? 'done' : 'idle'} />
+      <Outcome detail={detail} status={currentStatus} events={events} />
+    </motion.div>
+  )
+}
+
+function TicketHeader({ detail, status, connected }: { detail: TicketDetail; status: TicketDetail['status']; connected: boolean }) {
+  const t = detail.state.ticket
+  const meta = statusMeta(status, detail.resolution)
+  const [busy, setBusy] = useState(false)
+  const canRun = status !== 'processing'
+  const run = () => {
+    setBusy(true)
+    api.processTicket(detail.id).finally(() => setBusy(false))
+  }
+
+  return (
+    <div className="rounded-2xl border border-white/[0.07] bg-gradient-to-b from-white/[0.04] to-white/[0.015] p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-[11px] text-slate-500">
+            <span className="font-mono">TICKET #{detail.id}</span>
+            <span>·</span>
+            <span>{timeAgo(t.created_at)}</span>
+            <span>·</span>
+            <LiveDot on={connected} label={connected ? 'Streaming' : 'Reconnecting'} />
+          </div>
+          <h1 className="mt-1 text-lg font-semibold tracking-tight text-white">{t.subject}</h1>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
+            <span className="text-slate-200">{detail.customer_name ?? 'Unknown customer'}</span>
+            {detail.customer_email && <span className="text-slate-500">{detail.customer_email}</span>}
+            {detail.customer_tier && <Badge tone={tierTone[detail.customer_tier] ?? 'slate'}>{detail.customer_tier.toUpperCase()}</Badge>}
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-col items-end gap-2">
+          <span className={`inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium ring-1 ring-inset ${toneClasses[meta.tone]}`}>
+            {status === 'processing' ? <Spinner className="size-3" /> : <span aria-hidden>{meta.icon}</span>}
+            {meta.label}
+          </span>
+          {canRun && (
+            <button
+              type="button"
+              onClick={run}
+              disabled={busy}
+              className="text-[11px] text-slate-500 transition-colors hover:text-cyan-300 disabled:opacity-50"
+            >
+              ↻ {status === 'open' ? 'Run agents' : 'Re-run agents'}
+            </button>
+          )}
+        </div>
+      </div>
+      <p className="mt-3 max-h-36 overflow-y-auto rounded-xl bg-black/25 px-3 py-2.5 text-[13px] leading-relaxed whitespace-pre-line text-slate-300 ring-1 ring-white/[0.04]">
+        {t.body}
+      </p>
+    </div>
+  )
+}
+
+function TriageResults({ triage }: { triage: TriageResult }) {
+  const urgency = urgencyMeta[triage.urgency]
+  return (
+    <>
+      <div className="flex flex-wrap gap-1.5">
+        <Badge tone="cyan">{triage.category}</Badge>
+        <Badge tone={urgency.tone}>
+          <span className={`size-1.5 rounded-full ${urgency.dot}`} />
+          {urgency.label} urgency
+        </Badge>
+        <Badge tone={triage.sentiment === 'angry' ? 'rose' : triage.sentiment === 'frustrated' ? 'orange' : 'slate'}>
+          {sentimentEmoji[triage.sentiment]} {triage.sentiment}
+        </Badge>
+        <Badge>🌐 {triage.language.toUpperCase()}</Badge>
+      </div>
+      {triage.is_suspicious && (
+        <div className="rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-200 ring-1 ring-rose-400/25 ring-inset">
+          ⚠ Flagged as suspicious: possible attempt to manipulate the system
+        </div>
+      )}
+      <p className="text-[13px] text-slate-300">{triage.summary}</p>
+      <ConfidenceBar value={triage.confidence} />
+    </>
+  )
+}
+
+function ResearchResults({ research }: { research: ResearchResult }) {
+  const c = research.customer
+  return (
+    <>
+      {c && (
+        <div className="flex items-center gap-3 rounded-xl bg-white/[0.03] px-3 py-2.5 ring-1 ring-white/[0.05]">
+          <div className="grid size-8 place-items-center rounded-full bg-gradient-to-br from-cyan-400/30 to-violet-400/30 text-xs font-semibold text-white">
+            {c.name.split(' ').map((p) => p[0]).join('').slice(0, 2)}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[13px] font-medium text-slate-100">{c.name}</span>
+              <Badge tone={tierTone[c.tier]}>{c.tier === 'vip' ? '★ VIP' : c.tier.toUpperCase()}</Badge>
+            </div>
+            <p className="truncate text-[11px] text-slate-500">
+              {c.plan} · since {new Date(c.signup_date).toLocaleDateString(undefined, { month: 'short', year: 'numeric' })}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="font-mono text-sm text-slate-100 tabular-nums">{money(c.lifetime_value, 0)}</p>
+            <p className="text-[10px] tracking-wide text-slate-500 uppercase">LTV</p>
+          </div>
+        </div>
+      )}
+      <ul className="space-y-1.5">
+        {research.key_findings.map((f, i) => (
+          <motion.li
+            key={f}
+            initial={{ opacity: 0, x: -6 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ delay: i * 0.06 }}
+            className="flex gap-2 text-[13px] text-slate-300"
+          >
+            <span className="mt-[7px] size-1 shrink-0 rounded-full bg-cyan-300" />
+            {f}
+          </motion.li>
+        ))}
+      </ul>
+      <div className="flex flex-wrap gap-1.5 text-[11px] text-slate-500">
+        <span>💳 {research.payments.length} payments</span>
+        <span>·</span>
+        <span>📂 {research.past_tickets.length} past tickets</span>
+        {research.relevant_docs.map((d) => (
+          <span key={d.title} className="rounded bg-white/[0.04] px-1.5 text-slate-400">
+            📚 {d.title}
+          </span>
+        ))}
+      </div>
+    </>
+  )
+}
+
+function ActionResults({ action }: { action: ActionResult }) {
+  const meta = decisionMeta[action.decision]
+  const proposed = action.proposal
+  const overridden = proposed !== null && proposed.decision !== action.decision
+  const reasoning = action.reasoning.split('\n\nPolicy:')[0]
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-sm font-semibold ring-1 ring-inset ${toneClasses[meta.tone]}`}>
+          {meta.icon} {meta.label}
+          {action.refund_amount ? <span className="font-mono">{money(action.refund_amount)}</span> : null}
+        </span>
+        {overridden && (
+          <span className="text-xs text-slate-500">
+            AI proposed{' '}
+            <span className="text-slate-400 line-through decoration-amber-400/70">
+              {decisionMeta[proposed.decision].label}
+              {proposed.refund_amount ? ` ${money(proposed.refund_amount)}` : ''}
+            </span>{' '}
+            → <span className="text-amber-300">policy override</span>
+          </span>
+        )}
+      </div>
+
+      {action.rules_fired.length > 0 && (
+        <ul className="space-y-1 rounded-xl bg-amber-400/[0.06] px-3 py-2.5 ring-1 ring-amber-400/20 ring-inset">
+          {action.rules_fired.map((rule) => (
+            <li key={rule} className="flex items-center gap-2 text-xs text-amber-100">
+              <span aria-hidden>🛡️</span>
+              <code className="rounded bg-black/30 px-1 font-mono text-[10px] text-amber-300">{rule}</code>
+              <span>{ruleLabels[rule] ?? rule}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <ConfidenceBar value={action.confidence} />
+      <p className="text-xs leading-relaxed text-slate-400">{reasoning}</p>
+
+      <figure className="rounded-xl bg-black/25 px-3.5 py-3 ring-1 ring-white/[0.05]">
+        <figcaption className="mb-1.5 text-[10px] font-semibold tracking-[0.12em] text-slate-500 uppercase">
+          {action.decision === 'escalate' ? 'Draft reply for review' : 'Reply to customer'}
+        </figcaption>
+        <p className="text-[13px] leading-relaxed whitespace-pre-line text-slate-200">{action.reply_draft}</p>
+      </figure>
+    </>
+  )
+}
+
+function Outcome({ detail, status, events }: { detail: TicketDetail; status: TicketDetail['status']; events: StreamedEvent[] }) {
+  const notes = events.filter((e) => e.agent === 'human' || (e.agent === 'orchestrator' && e.status !== 'running' && !e.message.startsWith('All agents')))
+  const tokens = detail.state.usage.reduce((n, u) => n + u.input_tokens + u.output_tokens, 0)
+  const cost = detail.state.usage.reduce((n, u) => n + u.cost_usd, 0)
+  const edited = detail.resolution === 'edited'
+
+  const banner = (() => {
+    switch (status) {
+      case 'processing':
+        return { tone: 'cyan' as const, icon: <Spinner className="size-4" />, title: 'Agents are working', body: 'Results appear as each agent finishes.' }
+      case 'escalated':
+        return { tone: 'amber' as const, icon: '⚑', title: 'Awaiting human review in Slack', body: 'A reviewer can Approve & Send, Edit, or Reject the draft.' }
+      case 'resolved':
+        return detail.resolved_by === 'ai'
+          ? { tone: 'emerald' as const, icon: '✓', title: 'Resolved automatically', body: 'The reply was sent without human involvement.' }
+          : { tone: 'violet' as const, icon: '✓', title: `${edited ? 'Edited and approved' : 'Approved'} by @${detail.resolved_by}`, body: 'The reply was sent to the customer.' }
+      case 'rejected':
+        return { tone: 'rose' as const, icon: '✕', title: `Rejected by @${detail.resolved_by}`, body: 'This ticket needs manual handling.' }
+      default:
+        return { tone: 'slate' as const, icon: '•', title: 'Not processed yet', body: 'Run the agents to triage, research and resolve this ticket.' }
+    }
+  })()
+
+  return (
+    <motion.div layout="position" className={`rounded-2xl p-4 ring-1 ring-inset ${toneClasses[banner.tone]}`}>
+      <div className="flex items-start gap-3">
+        <motion.div
+          className="grid size-9 shrink-0 place-items-center rounded-xl bg-black/20 text-base"
+          animate={status === 'escalated' ? { scale: [1, 1.08, 1] } : { scale: 1 }}
+          transition={{ duration: 1.8, repeat: status === 'escalated' ? Infinity : 0 }}
+        >
+          {banner.icon}
+        </motion.div>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-semibold">{banner.title}</p>
+          <p className="text-xs opacity-75">{banner.body}</p>
+        </div>
+        {tokens > 0 && (
+          <div className="text-right font-mono text-[11px] text-slate-400 tabular-nums">
+            <p>{(tokens / 1000).toFixed(1)}k tokens</p>
+            <p>{money(cost, 4)}</p>
+          </div>
+        )}
+      </div>
+      <AnimatePresence initial={false}>
+        {notes.map((e) => (
+          <motion.p
+            key={e.id}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            className="mt-2 text-xs text-slate-300"
+          >
+            {e.message}
+          </motion.p>
+        ))}
+      </AnimatePresence>
+      {edited && detail.final_reply && (
+        <p className="mt-3 rounded-xl bg-black/25 px-3 py-2.5 text-[13px] whitespace-pre-line text-slate-200">{detail.final_reply}</p>
+      )}
+    </motion.div>
+  )
+}
