@@ -22,9 +22,10 @@ from dataclasses import dataclass, field
 
 from sqlmodel import Session, SQLModel, func, select
 
-from db import engine
+from db import create_db_and_tables, engine
 from models import (
     Customer,
+    DeliveryOperation,
     HelpDoc,
     PastTicket,
     Payment,
@@ -399,6 +400,12 @@ def build(today: dt.date) -> SeedData:
 
 
 def seed(reset: bool = False) -> None:
+    create_db_and_tables()
+    with Session(engine) as session:
+        if session.exec(select(DeliveryOperation).limit(1)).first() or session.exec(
+            select(Payment).where(Payment.stripe_charge_id.is_not(None)).limit(1)
+        ).first() or session.exec(select(Customer).where(Customer.demo_recipient.is_not(None)).limit(1)).first():
+            raise RuntimeError("Refuse reseeding or reset: provider bindings or operation audit records exist.")
     if reset:
         SQLModel.metadata.drop_all(engine)
     SQLModel.metadata.create_all(engine)

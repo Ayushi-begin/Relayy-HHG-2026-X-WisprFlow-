@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -8,6 +9,7 @@ import config
 import ticket_service
 from db import create_db_and_tables
 from integrations import slack
+from fulfillment import service as fulfillment
 from routers import slack as slack_routes
 from routers import tickets as ticket_routes
 
@@ -18,7 +20,14 @@ logging.basicConfig(level=logging.INFO)
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     ticket_service.recover_interrupted()
-    yield
+    fulfillment.recover_operations()
+    stop = asyncio.Event()
+    task = asyncio.create_task(fulfillment.worker(stop))
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
 
 
 app = FastAPI(title="Relayy API", lifespan=lifespan)
@@ -47,4 +56,5 @@ def health() -> dict[str, object]:
         "anthropic_configured": bool(config.ANTHROPIC_API_KEY),
         "slack_configured": slack.is_configured(),
         "slack_interactive": bool(config.SLACK_SIGNING_SECRET),
+        **fulfillment.readiness(),
     }

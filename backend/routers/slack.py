@@ -1,8 +1,4 @@
-"""POST /slack/interactions: button clicks and the Edit modal from escalation messages.
-
-Slack expects a response within 3 seconds, so message updates run as background tasks.
-Opening the modal is done inline because its trigger_id expires after 3 seconds.
-"""
+"""Signed, revision-checked Slack review interactions."""
 
 import json
 import logging
@@ -16,145 +12,159 @@ from sqlmodel import Session
 import ticket_service
 from db import engine
 from integrations import slack
-from models import Ticket
-from swarm.state import TicketState
+from models import Ticket, TicketRun
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-NOTES = {
-    "approved": "✅ Approved by {who}; reply sent to the customer",
-    "edited": "✏️ Edited and approved by {who}; reply sent to the customer",
-    "rejected": "❌ Rejected by {who}; needs manual handling",
-    "auto_resolved": "🤖 Resolved automatically",
-    "auto_refunded": "🤖 Refunded automatically",
-}
-
-
-def _note(ticket: Ticket, slack_user_id: str | None = None) -> str:
-    """Resolution line for the Slack message. Mentions the user when we have their Slack id."""
-    who = f"<@{slack_user_id}>" if slack_user_id else f"@{slack.escape(ticket.resolved_by or 'someone')}"
-    note = NOTES.get(ticket.resolution or "", f"Ticket is {ticket.status}").format(who=who)
-    if ticket.updated_at:
-        ts = int(ticket.updated_at.timestamp())
-        note += f" · <!date^{ts}^{{date_short_pretty}} at {{time}}|{ticket.updated_at:%Y-%m-%d %H:%M} UTC>"
-    return note
-
 
 def _user(payload: dict[str, Any]) -> tuple[str, str]:
-    user = payload.get("user", {})
+    user = payload.get("user") or {}
     return user.get("id", ""), user.get("username") or user.get("name") or user.get("id", "unknown")
 
 
-async def _refresh_message(ticket: Ticket, state: TicketState, note: str, target: dict[str, Any]) -> None:
+def _target(payload: dict[str, Any]) -> dict[str, str]:
+    container = payload.get("container") or {}
+    return {"channel": container.get("channel_id") or (payload.get("channel") or {}).get("id", ""),
+            "ts": container.get("message_ts", ""), "response_url": payload.get("response_url", "")}
+
+
+def _value(raw: str) -> dict[str, Any] | None:
     try:
-        await slack.update_message(ticket.id, state, note, sent_reply=ticket.final_reply, **target)
-    except (slack.SlackError, OSError):
-        log.exception("Could not update the Slack message for ticket %s", ticket.id)
+        value = json.loads(raw)
+        if not isinstance(value.get("ticket_id"), int) or not isinstance(value.get("run_id"), str) or \
+                not isinstance(value.get("expected_version"), int):
+            return None
+        return value
+    except (TypeError, ValueError):
+        return None
 
 
-async def _ephemeral(response_url: str | None, text: str) -> None:
+def _note(ticket: Ticket) -> str:
+    if ticket.resolution == "rejected":
+        return "Rejected; manual handling is required."
+    if ticket.resolution in {"approved", "edited"}:
+        return "Authorization queued; provider outcome will be posted when known."
+    return f"Ticket is {ticket.status}."
+
+
+async def _ephemeral(response_url: str, text: str) -> None:
     if not response_url:
         return
     try:
         await slack.post_ephemeral_note(response_url, text)
     except (slack.SlackError, OSError):
-        log.exception("Could not post an ephemeral Slack note")
+        log.exception("Could not post Slack ephemeral response")
+
+
+async def _refresh_message(ticket: Ticket, state, run: TicketRun, target: dict[str, str]) -> None:
+    try:
+        await slack.update_message(ticket.id, state, run.id, ticket.version, _note(ticket),
+                                   sent_reply=ticket.final_reply, channel=target.get("channel"), ts=target.get("ts"))
+    except (slack.SlackError, OSError):
+        # The DB action succeeded; never retry delivery based on a display refresh failure.
+        log.exception("Could not refresh Slack ticket %s", ticket.id)
 
 
 @router.post("/slack/interactions")
 async def slack_interactions(request: Request, background: BackgroundTasks) -> Response:
     body = await request.body()
-    if not slack.verify_signature(
-        body, request.headers.get("X-Slack-Request-Timestamp"), request.headers.get("X-Slack-Signature")
-    ):
+    if not slack.verify_signature(body, request.headers.get("X-Slack-Request-Timestamp"),
+                                  request.headers.get("X-Slack-Signature")):
         raise HTTPException(401, "Invalid Slack signature")
-
     try:
         payload = json.loads(parse_qs(body.decode())["payload"][0])
     except (KeyError, IndexError, ValueError):
         raise HTTPException(400, "Missing interaction payload")
-
-    match payload.get("type"):
-        case "block_actions":
-            return await _block_action(payload, background)
-        case "view_submission":
-            return _view_submission(payload, background)
+    if not slack.interaction_authorized(payload):
+        # Slack still receives a quick ACK; no ticket state is touched.
+        return Response()
+    if payload.get("type") == "block_actions":
+        return await _block_action(payload, background)
+    if payload.get("type") == "view_submission":
+        return _view_submission(payload, background)
     return Response()
 
 
 async def _block_action(payload: dict[str, Any], background: BackgroundTasks) -> Response:
-    action = payload["actions"][0]
-    action_id = action.get("action_id")
-    if action_id not in (slack.APPROVE, slack.EDIT, slack.REJECT):
+    actions = payload.get("actions") or []
+    if not actions:
         return Response()
-
-    ticket_id = int(action["value"])
+    action = actions[0]
+    if action.get("action_id") not in {slack.APPROVE, slack.EDIT, slack.REJECT}:
+        return Response()
+    value = _value(action.get("value", ""))
+    target = _target(payload)
+    if value is None:
+        background.add_task(_ephemeral, target["response_url"], "This review control is invalid. Refresh the ticket.")
+        return Response()
+    if action["action_id"] == slack.EDIT:
+        return await _open_editor(payload, value, target, background)
     user_id, username = _user(payload)
-    container = payload.get("container", {})
-    target = {
-        "channel": container.get("channel_id") or payload.get("channel", {}).get("id"),
-        "ts": container.get("message_ts"),
-        "response_url": payload.get("response_url"),
-    }
-
-    if action_id == slack.EDIT:
-        return await _open_editor(payload, ticket_id, target, background)
-
-    human_action = "approved" if action_id == slack.APPROVE else "rejected"
+    human_action = "approved" if action["action_id"] == slack.APPROVE else "rejected"
     try:
-        ticket, state, applied = ticket_service.apply_human_action(ticket_id, human_action, username, channel="slack")
-    except KeyError:
-        background.add_task(_ephemeral, target["response_url"], f"Ticket #{ticket_id} no longer exists.")
+        ticket, state, applied = ticket_service.apply_human_action(
+            value["ticket_id"], human_action, user_id or username, run_id=value["run_id"],
+            expected_version=value["expected_version"], channel="slack",
+        )
+    except (KeyError, ValueError):
+        background.add_task(_ephemeral, target["response_url"], "This review is no longer valid. Refresh the ticket.")
         return Response()
-    # If someone already handled it, show their decision instead.
-    background.add_task(_refresh_message, ticket, state, _note(ticket, user_id if applied else None), target)
+    if not applied:
+        # A transient stale click must not replace still-valid buttons.
+        background.add_task(_ephemeral, target["response_url"], "Someone else changed this ticket; refresh for its current state.")
+        return Response()
+    with Session(engine) as session:
+        run = session.get(TicketRun, value["run_id"])
+        current = session.get(Ticket, value["ticket_id"])
+    if run and current:
+        background.add_task(_refresh_message, current, state, run, target)
     return Response()
 
 
-async def _open_editor(
-    payload: dict[str, Any], ticket_id: int, target: dict[str, Any], background: BackgroundTasks
-) -> Response:
+async def _open_editor(payload: dict[str, Any], value: dict[str, Any], target: dict[str, str],
+                       background: BackgroundTasks) -> Response:
     with Session(engine) as session:
-        ticket = session.get(Ticket, ticket_id)
+        ticket = session.get(Ticket, value["ticket_id"])
+        run = session.get(TicketRun, value["run_id"])
         state = ticket_service.load_state(ticket) if ticket else None
-
-    if ticket is None or state.action is None:
-        background.add_task(_ephemeral, target["response_url"], f"Ticket #{ticket_id} has no reply to edit.")
+    if not ticket or not run or not state or ticket.current_run_id != run.id or ticket.version != value["expected_version"] or \
+            run.state != "reviewable" or not state.action:
+        background.add_task(_ephemeral, target["response_url"], "This review is stale. Refresh the ticket.")
         return Response()
-    if ticket.status != "escalated":
-        background.add_task(_refresh_message, ticket, state, _note(ticket), target)
-        return Response()
-
-    view = slack.edit_modal(ticket_id, state.action.reply_draft, {"ticket_id": ticket_id, **target})
+    metadata = {**value, "channel": target["channel"], "ts": target["ts"], "response_url": target["response_url"]}
     try:
-        await slack.open_modal(payload["trigger_id"], view)
-    except (slack.SlackError, OSError) as exc:
-        background.add_task(_ephemeral, target["response_url"], f"Couldn't open the editor: {exc}")
+        await slack.open_modal(payload["trigger_id"], slack.edit_modal(ticket.id, state.action.reply_draft, metadata))
+    except (slack.SlackError, OSError):
+        background.add_task(_ephemeral, target["response_url"], "Couldn't open the reply editor.")
     return Response()
 
 
 def _view_submission(payload: dict[str, Any], background: BackgroundTasks) -> Response:
-    view = payload.get("view", {})
+    view = payload.get("view") or {}
     if view.get("callback_id") != slack.EDIT_CALLBACK:
         return Response()
-
-    meta = json.loads(view.get("private_metadata") or "{}")
-    ticket_id = meta.pop("ticket_id")
-    reply = (view["state"]["values"][slack.EDIT_BLOCK][slack.EDIT_INPUT].get("value") or "").strip()
-    if not reply:
-        return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "The reply can't be empty."}})
-
+    try:
+        metadata = json.loads(view.get("private_metadata") or "{}")
+        value = _value(json.dumps({key: metadata[key] for key in ("ticket_id", "run_id", "expected_version")}))
+        reply = ((view.get("state") or {}).get("values") or {})[slack.EDIT_BLOCK][slack.EDIT_INPUT].get("value", "").strip()
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "This review has expired."}})
+    if not value or not reply:
+        return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "The reply can't be blank."}})
     user_id, username = _user(payload)
     try:
-        ticket, state, applied = ticket_service.apply_human_action(ticket_id, "edited", username, reply, channel="slack")
-    except KeyError:
-        return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "This ticket no longer exists."}})
+        ticket, state, applied = ticket_service.apply_human_action(
+            value["ticket_id"], "edited", user_id or username, run_id=value["run_id"],
+            expected_version=value["expected_version"], reply=reply, channel="slack",
+        )
+    except (KeyError, ValueError):
+        applied = False
     if not applied:
-        return JSONResponse({
-            "response_action": "errors",
-            "errors": {slack.EDIT_BLOCK: f"Already handled: ticket is {ticket.status}."},
-        })
-
-    background.add_task(_refresh_message, ticket, state, _note(ticket, user_id), meta)
-    return Response()  # an empty 200 closes the modal
+        return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "This review changed; refresh it."}})
+    with Session(engine) as session:
+        run = session.get(TicketRun, value["run_id"])
+        current = session.get(Ticket, value["ticket_id"])
+    if run and current:
+        background.add_task(_refresh_message, current, state, run, metadata)
+    return Response()

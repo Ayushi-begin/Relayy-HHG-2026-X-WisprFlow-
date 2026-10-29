@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 
+from swarm import llm
 from swarm.action import act
 from swarm.research import research
 from swarm.state import AgentName, Event, EventStatus, TicketData, TicketState
@@ -12,7 +13,7 @@ Emit = Callable[[str, str], None]  # (status, message), bound to the running age
 
 
 async def _run_triage(state: TicketState, emit: Emit) -> str:
-    state.triage = t = await triage(state.ticket, state.usage)
+    state.triage = t = await triage(state.ticket, state.usage, state.provenance, state.provenance_errors)
     flag = " (suspicious)" if t.is_suspicious else ""
     return f"{t.category} / {t.urgency} urgency / {t.sentiment}{flag}: {t.summary}"
 
@@ -61,7 +62,9 @@ async def run_pipeline(state: TicketState) -> AsyncIterator[Event]:
                 try:
                     summary = await step(state, lambda status, message, agent=agent: emit(agent, status, message))
                 except Exception as exc:  # surface agent failures as events instead of crashing the stream
-                    emit(agent, "error", f"{type(exc).__name__}: {exc}")
+                    error = llm.sanitized_error(exc)
+                    llm.record_provenance(state.provenance, state.provenance_errors, agent, "failed", error)
+                    emit(agent, "error", error)
                     emit("orchestrator", "error", f"Stopped after {agent} failed.")
                     return
                 emit(agent, "done", summary)

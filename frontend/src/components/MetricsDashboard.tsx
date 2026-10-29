@@ -77,7 +77,7 @@ export function MetricsDashboard({ refreshKey }: { refreshKey: number }) {
         <StatTile
           label="Cost per ticket"
           value={m.cost_per_ticket_usd === null ? '—' : money(m.cost_per_ticket_usd, 4)}
-          sub={`${money(m.total_cost_usd, 2)} total model spend`}
+          sub={`${m.total_cost_usd === null ? 'Cost unavailable' : `${money(m.total_cost_usd, 2)} total model spend`}`}
         />
       </div>
 

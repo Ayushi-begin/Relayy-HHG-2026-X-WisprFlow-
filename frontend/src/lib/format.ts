@@ -1,4 +1,4 @@
-import type { Decision, TicketStatus, Urgency } from '../api'
+import type { Decision, DeliveryOperation, TicketStatus, Urgency } from '../api'
 
 export type Tone = 'slate' | 'cyan' | 'amber' | 'emerald' | 'violet' | 'rose' | 'orange' | 'red'
 
@@ -81,4 +81,47 @@ export function clock(iso: string): string {
 
 export function pct(rate: number | null): string {
   return rate === null ? '—' : `${Math.round(rate * 100)}%`
+}
+
+export function moneyMinor(amount: number, currency: string): string {
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency.toUpperCase() }).format(amount / 100)
+}
+
+export function operationStateMeta(state: string): { label: string; tone: Tone } {
+  switch (state) {
+    case 'succeeded':
+      return { label: 'Succeeded', tone: 'emerald' }
+    case 'accepted':
+      return { label: 'Accepted by Resend', tone: 'emerald' }
+    case 'unknown':
+      return { label: 'Unknown', tone: 'amber' }
+    case 'failed':
+      return { label: 'Failed', tone: 'rose' }
+    case 'blocked':
+      return { label: 'Blocked', tone: 'rose' }
+    case 'pending':
+      return { label: 'Pending', tone: 'amber' }
+    case 'executing':
+      return { label: 'Checking provider', tone: 'cyan' }
+    case 'queued':
+      return { label: 'Queued', tone: 'cyan' }
+    default:
+      return { label: state.replaceAll('_', ' '), tone: 'slate' }
+  }
+}
+
+export const operationMeta = (operation: DeliveryOperation) => {
+  const email = operation.kind === 'email'
+  return {
+    label: email ? 'Email' : 'Refund',
+    provider: email ? 'Resend' : 'Stripe',
+    description: (_current: DeliveryOperation, amount: string | null) => {
+      if (email && operation.state === 'accepted') return 'Reply accepted by Resend. Inbox delivery is not confirmed.'
+      if (email && operation.state === 'failed') return 'Resend did not accept this email attempt.'
+      if (email) return 'Email is held until its prerequisites are safely confirmed.'
+      if (operation.state === 'succeeded') return `Stripe confirmed${amount ? ` a ${amount}` : ''} test refund.`
+      if (operation.state === 'unknown') return `Stripe confirmation${amount ? ` for the ${amount} test refund` : ''} was not received. Do not submit another refund.`
+      return `${amount ?? 'Refund'} status is provider-controlled.`
+    },
+  }
 }

@@ -70,9 +70,9 @@ def _brief(state: TicketState) -> str:
     if tri:
         lines.append(
             f"Triage: {tri.category}, {tri.urgency} urgency, {tri.sentiment}, language {tri.language}"
-            f"{', FLAGGED SUSPICIOUS' if tri.is_suspicious else ''}. Summary: {tri.summary}"
+            f"{', FLAGGED SUSPICIOUS' if tri.is_suspicious else ''}. Summary: {llm.sanitize_model_value(tri.summary)}"
         )
-    return "\n".join(lines) + "\n\n" + llm.ticket_block(t)
+    return llm.sanitize_model_value("\n".join(lines)) + "\n\n" + llm.ticket_block(t)
 
 
 def _parse_notes(response) -> list[str] | None:
@@ -155,8 +155,10 @@ async def _simulated_research(state: TicketState, emit: Emit, ctx: tools.ToolCon
 async def research(state: TicketState, emit: Emit) -> ResearchResult:
     ctx = tools.ToolContext(allowed_customer_id=state.ticket.customer_id)
 
-    if not config.ANTHROPIC_API_KEY:
-        log.info("No ANTHROPIC_API_KEY set; running simulated local tool execution.")
+    if not config.ANTHROPIC_API_KEY or not MODEL:
+        reason = "model credentials or configured model id unavailable"
+        log.info("%s; running simulated local tool execution.", reason)
+        llm.record_provenance(state.provenance, state.provenance_errors, "research", "simulated", reason)
         return await _simulated_research(state, emit, ctx)
 
     messages: list[dict] = [{"role": "user", "content": _brief(state)}]
@@ -176,6 +178,7 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
             llm.record_usage(state.usage, "research", MODEL, response)
             if response.stop_reason == "refusal":
                 emit("error", "Research model declined this ticket.")
+                llm.record_provenance(state.provenance, state.provenance_errors, "research", "failed", "model refused research")
                 break
 
             # Pass the assistant turn back unchanged (thinking blocks included); history stays append-only.
@@ -183,6 +186,10 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
                 findings = _parse_notes(response)
+                if findings is None:
+                    llm.record_provenance(
+                        state.provenance, state.provenance_errors, "research", "failed", "model returned incomplete research"
+                    )
                 break
             if iteration == MAX_ITERATIONS:
                 emit("tool", f"⏱️ Tool budget of {MAX_ITERATIONS} rounds used up; finishing with what was found.")
@@ -199,7 +206,9 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
                 results.append({"type": "text", "text": BUDGET_NOTE})
             messages.append({"role": "user", "content": results})
     except Exception as exc:
-        log.warning("Anthropic API error during research: %s; falling back to local database tools.", exc)
+        safe_error = llm.sanitized_error(exc)
+        log.warning("Anthropic API error during research; falling back to local database tools: %s", safe_error)
+        llm.record_provenance(state.provenance, state.provenance_errors, "research", "simulated", safe_error)
         return await _simulated_research(state, emit, ctx)
 
     # The policy step needs the tier even if the model never looked the customer up.
@@ -209,6 +218,8 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
         except tools.ToolError:
             pass
 
+    if state.provenance.get("research") is None:
+        llm.record_provenance(state.provenance, state.provenance_errors, "research", "real_model")
     return ResearchResult(
         customer=ctx.customer,
         payments=sorted(ctx.payments.values(), key=lambda p: p.date, reverse=True),

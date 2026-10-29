@@ -8,11 +8,12 @@ import { decisionMeta, money, ruleLabels, statusMeta, tierTone, timeAgo, toneCla
 import { phaseOf } from '../lib/phase'
 import type { FlowState } from '../lib/phase'
 import { AgentCard, FlowConnector } from './AgentCard'
+import { OperationOutcome } from './OperationOutcome'
 import { Badge, ConfidenceBar, LiveDot, Spinner } from './ui'
 
 const sentimentEmoji = { positive: '🙂', neutral: '😐', frustrated: '😣', angry: '😡' } as const
 
-export function TicketView({ ticketId }: { ticketId: number | null }) {
+export function TicketView({ ticketId, operatorToken }: { ticketId: number | null; operatorToken: string | null }) {
   if (ticketId === null) {
     return (
       <div className="grid h-full place-items-center p-10 text-center">
@@ -24,11 +25,11 @@ export function TicketView({ ticketId }: { ticketId: number | null }) {
       </div>
     )
   }
-  return <TicketStreamView key={ticketId} ticketId={ticketId} />
+  return <TicketStreamView key={ticketId} ticketId={ticketId} operatorToken={operatorToken} />
 }
 
-function TicketStreamView({ ticketId }: { ticketId: number }) {
-  const { detail, events, status, connected, error } = useTicketStream(ticketId)
+function TicketStreamView({ ticketId, operatorToken }: { ticketId: number; operatorToken: string | null }) {
+  const { detail, events, status, connected, error, replaceDetail } = useTicketStream(ticketId)
 
   if (error && !detail) return <p className="p-8 text-sm text-rose-300">Couldn't load ticket #{ticketId}: {error}</p>
   if (!detail) {
@@ -57,7 +58,8 @@ function TicketStreamView({ ticketId }: { ticketId: number }) {
       transition={{ duration: 0.3 }}
       className="mx-auto max-w-3xl px-1 pb-10"
     >
-      <TicketHeader detail={detail} status={currentStatus} connected={connected} />
+      {error && <p role="alert" className="mb-3 rounded-xl bg-rose-500/10 px-3 py-2 text-xs text-rose-200 ring-1 ring-rose-400/25">{error}</p>}
+      <TicketHeader detail={detail} status={currentStatus} connected={connected} operatorToken={operatorToken} onDetail={replaceDetail} />
 
       <FlowConnector state={phases[0] === 'idle' ? (currentStatus === 'processing' ? 'flowing' : 'idle') : 'done'} />
       <AgentCard emoji="🧭" title="Triage" model="haiku-5.5" role="Classifies category, urgency, sentiment and manipulation risk" events={triageEvents}>
@@ -75,19 +77,42 @@ function TicketStreamView({ ticketId }: { ticketId: number }) {
       </AgentCard>
 
       <FlowConnector state={finished ? 'done' : 'idle'} />
-      <Outcome detail={detail} status={currentStatus} events={events} />
+      <Outcome detail={detail} status={currentStatus} events={events} operatorToken={operatorToken} onDetail={replaceDetail} />
     </motion.div>
   )
 }
 
-function TicketHeader({ detail, status, connected }: { detail: TicketDetail; status: TicketDetail['status']; connected: boolean }) {
+function TicketHeader({
+  detail,
+  status,
+  connected,
+  operatorToken,
+  onDetail,
+}: {
+  detail: TicketDetail
+  status: TicketDetail['status']
+  connected: boolean
+  operatorToken: string | null
+  onDetail: (detail: TicketDetail) => void
+}) {
   const t = detail.state.ticket
   const meta = statusMeta(status, detail.resolution)
   const [busy, setBusy] = useState(false)
-  const canRun = status !== 'processing'
-  const run = () => {
+  const [error, setError] = useState<string | null>(null)
+  const canRun = operatorToken !== null && detail.can_reprocess && !detail.running && status !== 'processing'
+  const run = async () => {
+    if (operatorToken === null) return
     setBusy(true)
-    api.processTicket(detail.id).finally(() => setBusy(false))
+    setError(null)
+    try {
+      await api.processTicket(detail.id, operatorToken)
+      // Processing is accepted asynchronously; fetch its authoritative snapshot immediately.
+      onDetail(await api.getTicket(detail.id))
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
   }
 
   return (
@@ -113,12 +138,13 @@ function TicketHeader({ detail, status, connected }: { detail: TicketDetail; sta
             {status === 'processing' ? <Spinner className="size-3" /> : <span aria-hidden>{meta.icon}</span>}
             {meta.label}
           </span>
-          {canRun && (
+          {detail.can_reprocess && !detail.running && status !== 'processing' && (
             <button
               type="button"
-              onClick={run}
-              disabled={busy}
-              className="text-[11px] text-slate-500 transition-colors hover:text-cyan-300 disabled:opacity-50"
+              onClick={() => void run()}
+              disabled={busy || !canRun}
+              className="text-[11px] text-slate-500 transition-colors hover:text-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
+              title={operatorToken !== null ? undefined : 'Unlock operator actions first'}
             >
               ↻ {status === 'open' ? 'Run agents' : 'Re-run agents'}
             </button>
@@ -128,6 +154,7 @@ function TicketHeader({ detail, status, connected }: { detail: TicketDetail; sta
       <p className="mt-3 max-h-36 overflow-y-auto rounded-xl bg-black/25 px-3 py-2.5 text-[13px] leading-relaxed whitespace-pre-line text-slate-300 ring-1 ring-white/[0.04]">
         {t.body}
       </p>
+      {error && <p role="alert" className="mt-2 text-xs text-rose-300">{error}</p>}
     </div>
   )
 }
@@ -259,25 +286,37 @@ function ActionResults({ action }: { action: ActionResult }) {
   )
 }
 
-function HumanReviewCard({ detail }: { detail: TicketDetail }) {
+function HumanReviewCard({ detail, token, onDetail }: { detail: TicketDetail; token: string | null; onDetail: (detail: TicketDetail) => void }) {
   const draft = detail.state.action?.reply_draft ?? ''
   const [editing, setEditing] = useState(false)
   const [customReply, setCustomReply] = useState(draft)
-  const [reviewer, setReviewer] = useState('support_lead')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const handleAction = async (action: 'approved' | 'edited' | 'rejected') => {
+    if (token === null) {
+      setError('Unlock operator actions before reviewing a ticket.')
+      return
+    }
+    if (action === 'edited' && !customReply.trim()) {
+      setError('An edited reply cannot be blank.')
+      return
+    }
+    if (action === 'approved' && !draft.trim()) {
+      setError('There is no reply draft to approve.')
+      return
+    }
     setSubmitting(true)
     setError(null)
     try {
-      await api.reviewTicket(detail.id, {
+      onDetail(await api.reviewTicket(detail.id, {
         action,
-        reply: action === 'edited' ? customReply : draft,
-        reviewer,
-      })
-    } catch (e: any) {
-      setError(e.message || 'Review submission failed')
+        reply: action === 'edited' ? customReply.trim() : undefined,
+        run_id: detail.run_id,
+        expected_version: detail.version,
+      }, token))
+    } catch (e) {
+      setError((e as Error).message || 'Review submission failed')
     } finally {
       setSubmitting(false)
     }
@@ -292,16 +331,7 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
             Mission Control Human Review
           </h4>
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <span className="text-slate-400 text-[11px]">Reviewer:</span>
-          <input
-            type="text"
-            value={reviewer}
-            onChange={(e) => setReviewer(e.target.value)}
-            className="w-28 rounded bg-black/50 px-2 py-0.5 font-mono text-[11px] text-amber-200 ring-1 ring-white/10 focus:ring-amber-400 focus:outline-none"
-            placeholder="lead"
-          />
-        </div>
+        <span className="text-[11px] text-slate-500">Server records the configured operator.</span>
       </div>
 
       {editing ? (
@@ -329,7 +359,7 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
               <button
                 type="button"
                 onClick={() => handleAction('edited')}
-                disabled={submitting || !customReply.trim()}
+                disabled={submitting || token === null || !customReply.trim()}
                 className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1 text-xs font-semibold text-black hover:bg-amber-400 disabled:opacity-50"
               >
                 {submitting ? <Spinner className="size-3" /> : '✓'} Save & Approve
@@ -348,7 +378,7 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
             <button
               type="button"
               onClick={() => handleAction('approved')}
-              disabled={submitting}
+              disabled={submitting || token === null || !draft.trim()}
               className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 px-3.5 py-1.5 text-xs font-medium text-emerald-300 ring-1 ring-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-50 transition"
             >
               {submitting ? <Spinner className="size-3" /> : '✓'} Approve & Send
@@ -359,7 +389,7 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
                 setCustomReply(draft)
                 setEditing(true)
               }}
-              disabled={submitting}
+              disabled={submitting || token === null}
               className="flex items-center gap-1.5 rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 ring-1 ring-white/10 hover:bg-white/10 disabled:opacity-50 transition"
             >
               ✏️ Edit Draft
@@ -367,7 +397,7 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
             <button
               type="button"
               onClick={() => handleAction('rejected')}
-              disabled={submitting}
+              disabled={submitting || token === null}
               className="flex items-center gap-1.5 rounded-lg bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 ring-1 ring-rose-500/20 hover:bg-rose-500/20 disabled:opacity-50 transition ml-auto"
             >
               ✕ Reject Draft
@@ -383,10 +413,22 @@ function HumanReviewCard({ detail }: { detail: TicketDetail }) {
   )
 }
 
-function Outcome({ detail, status, events }: { detail: TicketDetail; status: TicketDetail['status']; events: StreamedEvent[] }) {
+function Outcome({
+  detail,
+  status,
+  events,
+  operatorToken,
+  onDetail,
+}: {
+  detail: TicketDetail
+  status: TicketDetail['status']
+  events: StreamedEvent[]
+  operatorToken: string | null
+  onDetail: (detail: TicketDetail) => void
+}) {
   const notes = events.filter((e) => e.agent === 'human' || (e.agent === 'orchestrator' && e.status !== 'running' && !e.message.startsWith('All agents')))
   const tokens = detail.state.usage.reduce((n, u) => n + u.input_tokens + u.output_tokens, 0)
-  const cost = detail.state.usage.reduce((n, u) => n + u.cost_usd, 0)
+  const cost = detail.state.usage.reduce((n, u) => n + (u.cost_usd ?? 0), 0)
   const edited = detail.resolution === 'edited'
 
   const banner = (() => {
@@ -397,8 +439,8 @@ function Outcome({ detail, status, events }: { detail: TicketDetail; status: Tic
         return { tone: 'amber' as const, icon: '⚑', title: 'Awaiting human review', body: 'Review and act below in Mission Control or via Slack notification.' }
       case 'resolved':
         return detail.resolved_by === 'ai'
-          ? { tone: 'emerald' as const, icon: '✓', title: 'Resolved automatically', body: 'The reply was sent without human involvement.' }
-          : { tone: 'violet' as const, icon: '✓', title: `${edited ? 'Edited and approved' : 'Approved'} by @${detail.resolved_by}`, body: 'The reply was sent to the customer.' }
+          ? { tone: 'emerald' as const, icon: '✓', title: 'Authorization complete', body: 'Provider outcome is shown separately below.' }
+          : { tone: 'violet' as const, icon: '✓', title: `${edited ? 'Edited and approved' : 'Approved'} by @${detail.resolved_by}`, body: 'Approval is not proof of email delivery.' }
       case 'rejected':
         return { tone: 'rose' as const, icon: '✕', title: `Rejected by @${detail.resolved_by}`, body: 'This ticket needs manual handling.' }
       default:
@@ -428,7 +470,8 @@ function Outcome({ detail, status, events }: { detail: TicketDetail; status: Tic
         )}
       </div>
 
-      {status === 'escalated' && <HumanReviewCard detail={detail} />}
+      {status === 'escalated' && detail.can_review && <HumanReviewCard detail={detail} token={operatorToken} onDetail={onDetail} />}
+      <OperationOutcome detail={detail} token={operatorToken} onDetail={onDetail} />
 
       <AnimatePresence initial={false}>
         {notes.map((e) => (

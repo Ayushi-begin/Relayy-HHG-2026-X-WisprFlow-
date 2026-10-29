@@ -4,6 +4,7 @@ import { api } from './api'
 import type { TicketSummary } from './api'
 import { Inbox } from './components/Inbox'
 import { NewTicketForm } from './components/NewTicketForm'
+import { OperatorAccess } from './components/OperatorAccess'
 import { TicketView } from './components/TicketView'
 import { LiveDot, Spinner } from './components/ui'
 import { useLiveUpdates } from './hooks/useLiveUpdates'
@@ -31,6 +32,8 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
+  // Deliberately React state only: never persist the operator token in browser storage.
+  const [operatorToken, setOperatorToken] = useState<string | null>(null)
 
   const loadTickets = useCallback(() => {
     api
@@ -110,6 +113,8 @@ function App() {
         </div>
       )}
 
+      <OperatorAccess token={operatorToken} onUnlock={setOperatorToken} onLock={() => setOperatorToken(null)} />
+
       <main className="min-h-0 flex-1">
         <AnimatePresence mode="wait" initial={false}>
           {tab === 'control' ? (
@@ -125,10 +130,10 @@ function App() {
                 <Inbox tickets={tickets} selectedId={selectedId} onSelect={setSelectedId} loading={loading} />
               </div>
               <div className="lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-                <TicketView ticketId={selectedId} />
+                <TicketView ticketId={selectedId} operatorToken={operatorToken} />
               </div>
               <div className="lg:col-span-2 lg:min-h-0 xl:col-span-1">
-                <NewTicketForm onCreated={onCreated} />
+                <NewTicketForm onCreated={onCreated} operatorToken={operatorToken} />
               </div>
             </motion.div>
           ) : (
