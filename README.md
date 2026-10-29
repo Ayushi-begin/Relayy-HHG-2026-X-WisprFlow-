@@ -2,6 +2,14 @@
 
 FastAPI backend + React frontend.
 
+## Delivery analysis and design
+
+Start with [the documentation index](docs/README.md) for the current-code assessment,
+requirements gaps, happy paths, edge cases, architecture diagrams, and proposed
+implementation plan. The assessment separates existing local demo behavior from
+the planned Resend and Stripe test-mode integrations. No provider execution is
+implied by the documentation.
+
 ```
 backend/    Python 3.11 · FastAPI · uvicorn · Anthropic SDK · SQLModel (SQLite)
 frontend/   React · Vite · TypeScript · Tailwind CSS
