@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from db import engine
 from events import bus
 from integrations import slack
-from models import Ticket, TicketStatus
+from models import Payment, PaymentStatus, Ticket, TicketStatus
 from swarm.orchestrator import run_pipeline
 from swarm.state import Event, TicketData, TicketState, utcnow
 
@@ -23,6 +23,19 @@ HumanAction = Literal["approved", "edited", "rejected"]
 # SSE stream see events before the final state is written to the DB.
 _live: dict[int, TicketState] = {}
 _tasks: set[asyncio.Task] = set()
+
+
+def _reconcile_refund(session: Session, customer_id: int | None, amount: float | None) -> None:
+    """Mark the matching succeeded payment as refunded in the database."""
+    if customer_id is None or amount is None:
+        return
+    payments = session.exec(
+        select(Payment).where(Payment.customer_id == customer_id, Payment.status == PaymentStatus.succeeded)
+    ).all()
+    match = next((p for p in payments if abs(p.amount - amount) < 0.005), None)
+    if match:
+        match.status = PaymentStatus.refunded
+        session.add(match)
 
 
 # --- Reading -------------------------------------------------------------------
@@ -95,6 +108,10 @@ async def _process(ticket_id: int, state: TicketState) -> None:
         action = state.action
         if action and action.decision in ("auto_resolve", "auto_refund"):
             resolution = "auto_refunded" if action.decision == "auto_refund" else "auto_resolved"
+            if action.decision == "auto_refund" and action.refund_amount:
+                with Session(engine) as session:
+                    _reconcile_refund(session, state.ticket.customer_id, action.refund_amount)
+                    session.commit()
             _append(ticket_id, state, "orchestrator", "done", "📨 Reply sent to the customer automatically.")
             _save(ticket_id, state, status=TicketStatus.resolved, resolution=resolution, resolved_by="ai",
                   final_reply=action.reply_draft)
@@ -103,7 +120,7 @@ async def _process(ticket_id: int, state: TicketState) -> None:
         # Escalate. Save first so a fast Slack click finds the ticket waiting for review.
         _save(ticket_id, state, status=TicketStatus.escalated)
         if not slack.is_configured():
-            _append(ticket_id, state, "orchestrator", "done", "🙋 Escalated for human review (Slack is not configured).")
+            _append(ticket_id, state, "orchestrator", "done", "🙋 Escalated for human review (review in Mission Control or configure Slack).")
         else:
             try:
                 where = await slack.post_escalation(ticket_id, state)
@@ -129,11 +146,11 @@ def recover_interrupted() -> None:
         session.commit()
 
 
-# --- Human decisions (from Slack) ----------------------------------------------
+# --- Human decisions (Slack or Web UI) ------------------------------------------
 
 
 def apply_human_action(
-    ticket_id: int, action: HumanAction, user: str, reply: str | None = None
+    ticket_id: int, action: HumanAction, user: str, reply: str | None = None, channel: str = "web"
 ) -> tuple[Ticket, TicketState, bool]:
     """Record a reviewer's decision. Returns (ticket, state, applied); applied is False if
     the ticket was not waiting for review (e.g. someone already handled it)."""
@@ -146,14 +163,19 @@ def apply_human_action(
             return ticket, state, False
 
         draft = state.action.reply_draft if state.action else None
+        location = "in Slack" if channel == "slack" else "in Mission Control"
         if action == "rejected":
             ticket.status = TicketStatus.rejected
-            message = f"❌ Rejected by @{user} in Slack; needs manual handling."
+            message = f"❌ Rejected by @{user} {location}; needs manual handling."
         else:
             ticket.status = TicketStatus.resolved
             ticket.final_reply = reply if action == "edited" else draft
-            message = (f"✏️ Edited and approved by @{user} in Slack; reply sent to the customer." if action == "edited"
-                       else f"✅ Approved by @{user} in Slack; reply sent to the customer.")
+            verb = "✏️ Edited and approved" if action == "edited" else "✅ Approved"
+            message = f"{verb} by @{user} {location}; reply sent to the customer."
+            # If refund was proposed, reconcile payment status upon approval
+            if state.action and state.action.refund_amount:
+                _reconcile_refund(session, ticket.customer_id, state.action.refund_amount)
+
         ticket.resolution = action
         ticket.resolved_by = user
 

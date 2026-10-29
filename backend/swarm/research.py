@@ -2,12 +2,16 @@
 
 import datetime as dt
 import json
+import logging
 from collections.abc import Callable
 
 from pydantic import BaseModel, ValidationError
 
+import config
 from swarm import llm, tools
 from swarm.state import ResearchResult, TicketState
+
+log = logging.getLogger(__name__)
 
 MODEL = llm.SMART_MODEL
 MAX_ITERATIONS = 6  # model calls per ticket
@@ -88,52 +92,115 @@ def _fallback_findings(ctx: tools.ToolContext) -> list[str]:
         findings.append(f"{c.tier.upper()} customer on {c.plan}, lifetime value ${c.lifetime_value:,.2f}")
     if ctx.payments:
         dupes = tools.find_duplicates(list(ctx.payments.values()))
-        findings += [f"Possible duplicate charge: ${d['amount']:,.2f} on {d['date']} (payments {d['payment_ids']})" for d in dupes]
+        findings += [f"Duplicate charge detected: ${d['amount']:,.2f} on {d['date']} (payments {d['payment_ids']})" for d in dupes]
     if ctx.past_tickets:
         findings.append(f"{len(ctx.past_tickets)} past tickets on record")
     return findings or ["No findings: research did not complete."]
 
 
+async def _simulated_research(state: TicketState, emit: Emit, ctx: tools.ToolContext) -> ResearchResult:
+    """Run local database tools deterministically when Anthropic API is not available."""
+    cid = ctx.allowed_customer_id
+    # 1. Lookup customer
+    if cid is not None:
+        emit("tool", f"🔎 Checking customer #{cid} in database")
+        try:
+            tools.lookup_customer(ctx, str(cid))
+        except tools.ToolError as err:
+            emit("tool", f"⚠️ Customer lookup: {err}")
+
+    # 2. Payments
+    if cid is not None:
+        emit("tool", "💳 Looking up recent payments (last 90 days)")
+        try:
+            tools.get_payments(ctx, cid, 90)
+        except tools.ToolError as err:
+            emit("tool", f"⚠️ Payments: {err}")
+
+    # 3. Past tickets
+    if cid is not None:
+        emit("tool", "📜 Checking customer's past ticket history")
+        try:
+            tools.get_past_tickets(ctx, cid)
+        except tools.ToolError as err:
+            emit("tool", f"⚠️ Past tickets: {err}")
+
+    # 4. Search help docs
+    query = state.ticket.subject
+    emit("tool", f"📚 Searching knowledge base for {query!r}")
+    try:
+        tools.search_help_docs(ctx, query)
+    except Exception as err:
+        emit("tool", f"⚠️ Help doc search: {err}")
+
+    # Build findings
+    findings = _fallback_findings(ctx)
+    if state.triage and state.triage.category == "refund":
+        dupes = tools.find_duplicates(list(ctx.payments.values()))
+        if dupes:
+            for d in dupes:
+                findings.append(f"Confirmed duplicate payment of ${d['amount']:.2f} on {d['date']}")
+        else:
+            findings.append("No duplicate payment detected in the last 90 days.")
+
+    return ResearchResult(
+        customer=ctx.customer,
+        payments=sorted(ctx.payments.values(), key=lambda p: p.date, reverse=True),
+        past_tickets=ctx.past_tickets,
+        relevant_docs=list(ctx.docs.values()),
+        key_findings=findings,
+    )
+
+
 async def research(state: TicketState, emit: Emit) -> ResearchResult:
     ctx = tools.ToolContext(allowed_customer_id=state.ticket.customer_id)
+
+    if not config.ANTHROPIC_API_KEY:
+        log.info("No ANTHROPIC_API_KEY set; running simulated local tool execution.")
+        return await _simulated_research(state, emit, ctx)
+
     messages: list[dict] = [{"role": "user", "content": _brief(state)}]
     findings: list[str] | None = None
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
-        response = await llm.client().beta.messages.create(
-            model=MODEL,
-            max_tokens=16000,
-            output_config={"effort": "medium", "format": NOTES_FORMAT},
-            system=SYSTEM_PROMPT,
-            tools=tools.TOOLS,
-            messages=messages,
-            **llm.FALLBACK,
-        )
-        llm.record_usage(state.usage, "research", MODEL, response)
-        if response.stop_reason == "refusal":
-            emit("error", "Research model declined this ticket.")
-            break
+    try:
+        for iteration in range(1, MAX_ITERATIONS + 1):
+            response = await llm.client().beta.messages.create(
+                model=MODEL,
+                max_tokens=16000,
+                output_config={"effort": "medium", "format": NOTES_FORMAT},
+                system=SYSTEM_PROMPT,
+                tools=tools.TOOLS,
+                messages=messages,
+                **llm.FALLBACK,
+            )
+            llm.record_usage(state.usage, "research", MODEL, response)
+            if response.stop_reason == "refusal":
+                emit("error", "Research model declined this ticket.")
+                break
 
-        # Pass the assistant turn back unchanged (thinking blocks included); history stays append-only.
-        messages.append({"role": "assistant", "content": response.content})
-        tool_uses = [b for b in response.content if b.type == "tool_use"]
-        if not tool_uses:
-            findings = _parse_notes(response)
-            break
-        if iteration == MAX_ITERATIONS:
-            emit("tool", f"⏱️ Tool budget of {MAX_ITERATIONS} rounds used up; finishing with what was found.")
-            break
+            # Pass the assistant turn back unchanged (thinking blocks included); history stays append-only.
+            messages.append({"role": "assistant", "content": response.content})
+            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            if not tool_uses:
+                findings = _parse_notes(response)
+                break
+            if iteration == MAX_ITERATIONS:
+                emit("tool", f"⏱️ Tool budget of {MAX_ITERATIONS} rounds used up; finishing with what was found.")
+                break
 
-        results = []
-        for call in tool_uses:
-            emit("tool", tools.describe_call(call.name, call.input))
-            output, is_error = tools.execute(ctx, call.name, call.input)
-            if is_error:
-                emit("tool", f"⚠️ {call.name}: {output}")
-            results.append({"type": "tool_result", "tool_use_id": call.id, "content": output, "is_error": is_error})
-        if iteration == MAX_ITERATIONS - 1:
-            results.append({"type": "text", "text": BUDGET_NOTE})
-        messages.append({"role": "user", "content": results})
+            results = []
+            for call in tool_uses:
+                emit("tool", tools.describe_call(call.name, call.input))
+                output, is_error = tools.execute(ctx, call.name, call.input)
+                if is_error:
+                    emit("tool", f"⚠️ {call.name}: {output}")
+                results.append({"type": "tool_result", "tool_use_id": call.id, "content": output, "is_error": is_error})
+            if iteration == MAX_ITERATIONS - 1:
+                results.append({"type": "text", "text": BUDGET_NOTE})
+            messages.append({"role": "user", "content": results})
+    except Exception as exc:
+        log.warning("Anthropic API error during research: %s; falling back to local database tools.", exc)
+        return await _simulated_research(state, emit, ctx)
 
     # The policy step needs the tier even if the model never looked the customer up.
     if ctx.customer is None and ctx.allowed_customer_id is not None:

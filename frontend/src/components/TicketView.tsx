@@ -259,6 +259,130 @@ function ActionResults({ action }: { action: ActionResult }) {
   )
 }
 
+function HumanReviewCard({ detail }: { detail: TicketDetail }) {
+  const draft = detail.state.action?.reply_draft ?? ''
+  const [editing, setEditing] = useState(false)
+  const [customReply, setCustomReply] = useState(draft)
+  const [reviewer, setReviewer] = useState('support_lead')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleAction = async (action: 'approved' | 'edited' | 'rejected') => {
+    setSubmitting(true)
+    setError(null)
+    try {
+      await api.reviewTicket(detail.id, {
+        action,
+        reply: action === 'edited' ? customReply : draft,
+        reviewer,
+      })
+    } catch (e: any) {
+      setError(e.message || 'Review submission failed')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-xl border border-amber-400/20 bg-amber-500/[0.05] p-3.5 text-slate-200">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-amber-400/10 pb-2.5">
+        <div className="flex items-center gap-2">
+          <span className="flex size-2 rounded-full bg-amber-400 animate-pulse" />
+          <h4 className="text-xs font-semibold uppercase tracking-wider text-amber-300">
+            Mission Control Human Review
+          </h4>
+        </div>
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-slate-400 text-[11px]">Reviewer:</span>
+          <input
+            type="text"
+            value={reviewer}
+            onChange={(e) => setReviewer(e.target.value)}
+            className="w-28 rounded bg-black/50 px-2 py-0.5 font-mono text-[11px] text-amber-200 ring-1 ring-white/10 focus:ring-amber-400 focus:outline-none"
+            placeholder="lead"
+          />
+        </div>
+      </div>
+
+      {editing ? (
+        <div className="mt-3">
+          <label className="block text-[11px] font-medium text-slate-400 mb-1">
+            Customize Draft Reply:
+          </label>
+          <textarea
+            value={customReply}
+            onChange={(e) => setCustomReply(e.target.value)}
+            rows={5}
+            className="w-full rounded-lg bg-black/60 p-2.5 font-sans text-xs text-white ring-1 ring-white/15 focus:ring-amber-400 focus:outline-none"
+          />
+          <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+            <span>{customReply.length} characters</span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                disabled={submitting}
+                className="rounded-lg px-2.5 py-1 text-xs text-slate-400 hover:text-slate-200"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAction('edited')}
+                disabled={submitting || !customReply.trim()}
+                className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1 text-xs font-semibold text-black hover:bg-amber-400 disabled:opacity-50"
+              >
+                {submitting ? <Spinner className="size-3" /> : '✓'} Save & Approve
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3">
+          <p className="text-[11px] text-slate-400 mb-1 font-medium">Proposed Response Draft:</p>
+          <div className="rounded-lg bg-black/40 p-2.5 text-xs leading-relaxed text-slate-300 whitespace-pre-line ring-1 ring-white/10">
+            {draft || '(No reply draft available)'}
+          </div>
+
+          <div className="mt-3.5 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => handleAction('approved')}
+              disabled={submitting}
+              className="flex items-center gap-1.5 rounded-lg bg-emerald-500/20 px-3.5 py-1.5 text-xs font-medium text-emerald-300 ring-1 ring-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-50 transition"
+            >
+              {submitting ? <Spinner className="size-3" /> : '✓'} Approve & Send
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCustomReply(draft)
+                setEditing(true)
+              }}
+              disabled={submitting}
+              className="flex items-center gap-1.5 rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 ring-1 ring-white/10 hover:bg-white/10 disabled:opacity-50 transition"
+            >
+              ✏️ Edit Draft
+            </button>
+            <button
+              type="button"
+              onClick={() => handleAction('rejected')}
+              disabled={submitting}
+              className="flex items-center gap-1.5 rounded-lg bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-300 ring-1 ring-rose-500/20 hover:bg-rose-500/20 disabled:opacity-50 transition ml-auto"
+            >
+              ✕ Reject Draft
+            </button>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p className="mt-2 text-xs text-rose-400 font-mono">{error}</p>
+      )}
+    </div>
+  )
+}
+
 function Outcome({ detail, status, events }: { detail: TicketDetail; status: TicketDetail['status']; events: StreamedEvent[] }) {
   const notes = events.filter((e) => e.agent === 'human' || (e.agent === 'orchestrator' && e.status !== 'running' && !e.message.startsWith('All agents')))
   const tokens = detail.state.usage.reduce((n, u) => n + u.input_tokens + u.output_tokens, 0)
@@ -270,7 +394,7 @@ function Outcome({ detail, status, events }: { detail: TicketDetail; status: Tic
       case 'processing':
         return { tone: 'cyan' as const, icon: <Spinner className="size-4" />, title: 'Agents are working', body: 'Results appear as each agent finishes.' }
       case 'escalated':
-        return { tone: 'amber' as const, icon: '⚑', title: 'Awaiting human review in Slack', body: 'A reviewer can Approve & Send, Edit, or Reject the draft.' }
+        return { tone: 'amber' as const, icon: '⚑', title: 'Awaiting human review', body: 'Review and act below in Mission Control or via Slack notification.' }
       case 'resolved':
         return detail.resolved_by === 'ai'
           ? { tone: 'emerald' as const, icon: '✓', title: 'Resolved automatically', body: 'The reply was sent without human involvement.' }
@@ -303,6 +427,9 @@ function Outcome({ detail, status, events }: { detail: TicketDetail; status: Tic
           </div>
         )}
       </div>
+
+      {status === 'escalated' && <HumanReviewCard detail={detail} />}
+
       <AnimatePresence initial={false}>
         {notes.map((e) => (
           <motion.p

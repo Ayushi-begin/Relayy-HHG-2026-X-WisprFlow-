@@ -147,6 +147,12 @@ export interface NewTicket {
   customer_email: string
 }
 
+export interface HumanReviewPayload {
+  action: 'approved' | 'edited' | 'rejected'
+  reply?: string
+  reviewer?: string
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -174,5 +180,10 @@ export const api = {
       body: JSON.stringify(ticket),
     }),
   processTicket: (id: number) => request<{ id: number }>(`/tickets/${id}/process`, { method: 'POST' }),
+  reviewTicket: (id: number, payload: HumanReviewPayload) =>
+    request<TicketDetail>(`/tickets/${id}/review`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   metrics: () => request<Metrics>('/metrics'),
 }

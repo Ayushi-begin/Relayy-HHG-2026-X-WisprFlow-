@@ -103,7 +103,7 @@ async def _block_action(payload: dict[str, Any], background: BackgroundTasks) ->
 
     human_action = "approved" if action_id == slack.APPROVE else "rejected"
     try:
-        ticket, state, applied = ticket_service.apply_human_action(ticket_id, human_action, username)
+        ticket, state, applied = ticket_service.apply_human_action(ticket_id, human_action, username, channel="slack")
     except KeyError:
         background.add_task(_ephemeral, target["response_url"], f"Ticket #{ticket_id} no longer exists.")
         return Response()
@@ -147,7 +147,7 @@ def _view_submission(payload: dict[str, Any], background: BackgroundTasks) -> Re
 
     user_id, username = _user(payload)
     try:
-        ticket, state, applied = ticket_service.apply_human_action(ticket_id, "edited", username, reply)
+        ticket, state, applied = ticket_service.apply_human_action(ticket_id, "edited", username, reply, channel="slack")
     except KeyError:
         return JSONResponse({"response_action": "errors", "errors": {slack.EDIT_BLOCK: "This ticket no longer exists."}})
     if not applied:

@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -23,6 +24,12 @@ class TicketCreate(BaseModel):
     body: str = Field(min_length=1, max_length=10_000)
     customer_email: str | None = None
     customer_id: int | None = None
+
+
+class HumanReviewRequest(BaseModel):
+    action: Literal["approved", "edited", "rejected"]
+    reply: str | None = None
+    reviewer: str = "support_lead"
 
 
 class TicketAccepted(BaseModel):
@@ -104,6 +111,46 @@ async def process_ticket(ticket_id: int) -> TicketAccepted:
     if not ticket_service.start_processing(ticket_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "Ticket is already being processed")
     return _accepted(ticket_id)
+
+
+@router.post("/tickets/{ticket_id}/review")
+def review_ticket(ticket_id: int, payload: HumanReviewRequest) -> TicketDetail:
+    """Submit a human review decision (Approve, Edit, Reject) directly from the Web UI."""
+    with Session(engine) as session:
+        t = _get_ticket(session, ticket_id)
+        if t.status != "escalated":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Ticket #{ticket_id} is not waiting for review (current status: {t.status})",
+            )
+    try:
+        ticket, state, applied = ticket_service.apply_human_action(
+            ticket_id, payload.action, payload.reviewer, payload.reply, channel="web"
+        )
+    except KeyError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Ticket #{ticket_id} not found")
+
+    if not applied:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Ticket #{ticket_id} was already handled or is being processed",
+        )
+
+    with Session(engine) as session:
+        t = _get_ticket(session, ticket_id)
+        customer = session.get(Customer, t.customer_id)
+        return TicketDetail(
+            id=t.id,
+            status=t.status,
+            customer_name=customer.name if customer else None,
+            customer_email=customer.email if customer else None,
+            customer_tier=customer.tier if customer else None,
+            resolution=t.resolution,
+            resolved_by=t.resolved_by,
+            final_reply=t.final_reply,
+            running=ticket_service.is_running(t.id),
+            state=ticket_service.load_state(t),
+        )
 
 
 @router.get("/tickets")
