@@ -111,10 +111,15 @@ def _fallback(summary: str) -> TriageResult:
     )
 
 
-async def triage(ticket: TicketData, usage: list[Usage] | None = None) -> TriageResult:
-    # 1. Sanitize PII before processing
-    redacted_body = security.redact_pii(ticket.body).text
-    redacted_subj = security.redact_pii(ticket.subject).text
+async def triage(
+    ticket: TicketData,
+    usage: list[Usage] | None = None,
+    provenance: dict[str, str] | None = None,
+    provenance_errors: dict[str, str] | None = None,
+) -> TriageResult:
+    # Shared selected-pattern sanitizer for every ticket prompt. This is not a general PII guarantee.
+    redacted_body = llm.sanitize_model_value(ticket.body)
+    redacted_subj = llm.sanitize_model_value(ticket.subject)
     sanitized_ticket = TicketData(
         id=ticket.id,
         customer_id=ticket.customer_id,
@@ -126,8 +131,10 @@ async def triage(ticket: TicketData, usage: list[Usage] | None = None) -> Triage
     # 2. Check manipulation regex tripwires immediately
     tripwire = security.detect_manipulation(sanitized_ticket.subject, sanitized_ticket.body)
 
-    if not config.ANTHROPIC_API_KEY:
-        log.info("No ANTHROPIC_API_KEY set; running heuristic triage simulation.")
+    if not config.ANTHROPIC_API_KEY or not MODEL:
+        reason = "model credentials or configured model id unavailable"
+        log.info("%s; running heuristic triage simulation.", reason)
+        llm.record_provenance(provenance, provenance_errors, "triage", "simulated", reason)
         return _heuristic_triage(sanitized_ticket)
 
     try:
@@ -142,14 +149,21 @@ async def triage(ticket: TicketData, usage: list[Usage] | None = None) -> Triage
         llm.record_usage(usage, "triage", MODEL, response)
 
         if response.stop_reason == "refusal":
+            llm.record_provenance(provenance, provenance_errors, "triage", "failed", "model refused triage")
             return _fallback("Triage model declined to classify this ticket; needs human review.")
         if response.parsed_output is None:
+            llm.record_provenance(
+                provenance, provenance_errors, "triage", "failed", f"model produced no result ({response.stop_reason})"
+            )
             return _fallback(f"Triage produced no result (stop_reason={response.stop_reason}); needs human review.")
         
         result = response.parsed_output
         if tripwire.detected:
             result.is_suspicious = True
+        llm.record_provenance(provenance, provenance_errors, "triage", "real_model")
         return result
     except Exception as exc:
-        log.warning("Anthropic API error during triage: %s; falling back to heuristic classification.", exc)
+        safe_error = llm.sanitized_error(exc)
+        log.warning("Anthropic API error during triage; falling back to heuristic classification: %s", safe_error)
+        llm.record_provenance(provenance, provenance_errors, "triage", "simulated", safe_error)
         return _heuristic_triage(sanitized_ticket)

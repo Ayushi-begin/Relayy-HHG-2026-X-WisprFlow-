@@ -17,6 +17,7 @@ from sqlmodel import Session, select
 
 from db import engine
 from models import Customer, HelpDoc, PastTicket, Payment, PaymentStatus
+from swarm import llm
 from swarm.state import CustomerProfile, DocSnippet, PastTicketRecord, PaymentRecord
 
 MAX_PAYMENT_DAYS = 3 * 365
@@ -38,7 +39,9 @@ class ToolContext:
     docs: dict[str, DocSnippet] = field(default_factory=dict)
 
     def check_customer(self, customer_id: int) -> None:
-        if self.allowed_customer_id is not None and customer_id != self.allowed_customer_id:
+        if self.allowed_customer_id is None:
+            raise ToolError("Access denied: customer scope is required before records can be looked up.")
+        if customer_id != self.allowed_customer_id:
             raise ToolError(
                 f"Access denied: only the customer who sent this ticket (id {self.allowed_customer_id}) can be looked up."
             )
@@ -48,6 +51,9 @@ class ToolContext:
 
 
 def lookup_customer(ctx: ToolContext, email_or_id: str) -> dict[str, Any]:
+    # Do not even reveal whether an arbitrary customer exists without ticket scope.
+    if ctx.allowed_customer_id is None:
+        raise ToolError("Access denied: customer scope is required before records can be looked up.")
     key = email_or_id.strip()
     with Session(engine) as session:
         if key.isdigit():
@@ -205,7 +211,7 @@ def execute(ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> tuple[st
     if handler is None:
         return f"Unknown tool {name!r}. Available tools: {', '.join(_HANDLERS)}.", True
     try:
-        return json.dumps(handler(ctx, **tool_input)), False
+        return json.dumps(llm.sanitize_model_value(handler(ctx, **tool_input))), False
     except ToolError as exc:
         return str(exc), True
     except TypeError as exc:

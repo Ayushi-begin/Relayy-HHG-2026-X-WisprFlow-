@@ -54,7 +54,7 @@ const PRESETS: Preset[] = [
 
 const EMPTY: NewTicket = { customer_email: '', subject: '', body: '' }
 
-export function NewTicketForm({ onCreated }: { onCreated: (id: number) => void }) {
+export function NewTicketForm({ onCreated, operatorToken }: { onCreated: (id: number) => void; operatorToken: string | null }) {
   const [form, setForm] = useState<NewTicket>(EMPTY)
   const [sending, setSending] = useState<string | null>(null) // preset key or "form"
   const [error, setError] = useState<string | null>(null)
@@ -62,8 +62,13 @@ export function NewTicketForm({ onCreated }: { onCreated: (id: number) => void }
   const submit = async (ticket: NewTicket, key: string) => {
     setSending(key)
     setError(null)
+    if (operatorToken === null) {
+      setError('Unlock operator actions before creating a ticket.')
+      setSending(null)
+      return
+    }
     try {
-      const created = await api.createTicket(ticket)
+      const created = await api.createTicket(ticket, operatorToken)
       onCreated(created.id)
       if (key === 'form') setForm(EMPTY)
     } catch (e) {
@@ -91,7 +96,7 @@ export function NewTicketForm({ onCreated }: { onCreated: (id: number) => void }
               <motion.button
                 key={p.key}
                 type="button"
-                disabled={sending !== null}
+                disabled={sending !== null || operatorToken === null}
                 onClick={() => void submit(p, p.key)}
                 initial={{ opacity: 0, y: 6 }}
                 animate={{ opacity: 1, y: 0 }}
@@ -153,13 +158,16 @@ export function NewTicketForm({ onCreated }: { onCreated: (id: number) => void }
           </label>
           <button
             type="submit"
-            disabled={sending !== null}
+            disabled={sending !== null || operatorToken === null}
             className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-500 px-4 py-2.5 text-sm font-semibold text-slate-950 shadow-[0_8px_30px_-8px_rgba(34,211,238,0.5)] transition hover:brightness-110 disabled:opacity-60"
           >
             {sending === 'form' ? <Spinner className="size-4" /> : '🚀'} Send to agents
           </button>
         </form>
 
+        <p className="rounded-xl bg-cyan-400/[0.04] px-3 py-2 text-[11px] leading-relaxed text-slate-400 ring-1 ring-cyan-400/10">
+          Hackathon demo · provider delivery is test-only. Seeded customer addresses are never used for delivery; only server-approved test recipients may receive email.
+        </p>
         {error && (
           <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl bg-rose-500/10 px-3 py-2 text-xs text-rose-200 ring-1 ring-rose-400/25">
             {error}

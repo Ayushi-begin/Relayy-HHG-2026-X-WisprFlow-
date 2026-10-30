@@ -53,10 +53,19 @@ class CustomerProfile(BaseModel):
 
 class PaymentRecord(BaseModel):
     id: int
-    amount: float
+    customer_id: int | None = None
+    # Legacy display value only. Refund safety uses amount_minor and currency.
+    amount: float | None = None
     date: dt.datetime
     status: str
     description: str
+    provider_account_id: str | None = None
+    stripe_charge_id: str | None = None
+    amount_minor: int | None = None
+    currency: str | None = None
+    livemode: bool | None = None
+    binding_verified_at: dt.datetime | None = None
+    eligibility_evidence: dict | None = None
 
 
 class PastTicketRecord(BaseModel):
@@ -90,7 +99,16 @@ class ActionProposal(BaseModel):
         description="Reply to send instead if a human must review first. Acknowledges the specific issue "
         "with empathy, says a specialist will follow up, and promises no refund or outcome."
     )
-    refund_amount: float | None = Field(description="Amount to refund for auto_refund, otherwise null.")
+    # refund_amount remains only for existing displays. Exact money authorization uses the fields below.
+    refund_amount: float | None = Field(default=None, description="Legacy display amount; otherwise null.")
+    payment_id: int | None = Field(
+        default=None,
+        description="Exact local payment id from scoped research for auto_refund, otherwise null.",
+    )
+    refund_amount_minor: int | None = Field(
+        default=None,
+        description="Exact full refund in integer minor units for auto_refund, otherwise null.",
+    )
     reasoning: str = Field(description="Two or three sentences for the support team explaining the decision.")
     confidence: float = Field(ge=0, le=1, description="Confidence that this decision is correct, from 0 to 1.")
 
@@ -99,6 +117,8 @@ class ActionResult(BaseModel):
     decision: Decision
     reply_draft: str
     refund_amount: float | None = None
+    payment_id: int | None = None
+    refund_amount_minor: int | None = None
     reasoning: str
     confidence: float = Field(ge=0, le=1)
     proposal: ActionProposal | None = None  # the model's original proposal, before policy
@@ -114,7 +134,8 @@ class Usage(BaseModel):
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
-    cost_usd: float = 0.0
+    # Pricing is unavailable unless it is explicitly verified for the configured model.
+    cost_usd: float | None = None
 
 
 class Event(BaseModel):
@@ -131,7 +152,10 @@ class TicketState(BaseModel):
     action: ActionResult | None = None
     events: list[Event] = Field(default_factory=list)
     usage: list[Usage] = Field(default_factory=list)
+    provenance: dict[str, Literal["real_model", "simulated", "failed"]] = Field(default_factory=dict)
+    provenance_errors: dict[str, str] = Field(default_factory=dict)
 
     @property
-    def cost_usd(self) -> float:
-        return sum(u.cost_usd for u in self.usage)
+    def cost_usd(self) -> float | None:
+        costs = [u.cost_usd for u in self.usage]
+        return sum(cost for cost in costs if cost is not None) if all(cost is not None for cost in costs) else None

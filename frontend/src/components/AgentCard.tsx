@@ -18,12 +18,14 @@ interface Props {
   emoji: string
   title: string
   model: string
+  provenance: 'real_model' | 'simulated' | 'failed' | 'unknown'
+  provenanceError?: string
   role: string
   events: StreamedEvent[]
   children?: ReactNode // results, shown once the agent is done
 }
 
-export function AgentCard({ emoji, title, model, role, events, children }: Props) {
+export function AgentCard({ emoji, title, model, provenance, provenanceError, role, events, children }: Props) {
   const phase = phaseOf(events)
   const [showLog, setShowLog] = useState(false)
   const log = events.filter((e) => e.status !== 'done')
@@ -63,6 +65,10 @@ export function AgentCard({ emoji, title, model, role, events, children }: Props
             <span className="font-mono text-[10px] text-slate-500">{model}</span>
           </div>
           <p className="truncate text-xs text-slate-500">{role}</p>
+          <p className={`mt-0.5 text-[10px] ${provenance === 'real_model' ? 'text-emerald-400/80' : provenance === 'failed' ? 'text-rose-300' : 'text-amber-300'}`}>
+            {provenance === 'real_model' ? 'Recorded model run' : provenance === 'simulated' ? 'Simulated stage — no verified model run' : provenance === 'failed' ? 'Stage failed' : 'No verified model run'}
+            {provenanceError && ` · ${provenanceError}`}
+          </p>
         </div>
         <PhaseLabel phase={phase} seconds={seconds} />
       </header>

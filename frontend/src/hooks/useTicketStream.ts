@@ -4,7 +4,19 @@ import type { SwarmEvent, TicketDetail, TicketStatus } from '../api'
 
 export interface StreamedEvent extends SwarmEvent {
   id: number
+  ticket_id?: number
+  run_id?: string | null
+  version?: number
 }
+
+interface TicketEventEnvelope {
+  ticket_id: number
+  run_id: string | null
+  kind: string
+  timestamp: string
+  data: unknown
+}
+
 
 interface TicketStream {
   detail: TicketDetail | null
@@ -12,12 +24,15 @@ interface TicketStream {
   status: TicketStatus | null
   connected: boolean
   error: string | null
+  replaceDetail: (detail: TicketDetail) => void
 }
 
+const snapshotEvents = (detail: TicketDetail): StreamedEvent[] =>
+  detail.state.events.map((event, index) => ({ ...event, id: -(index + 1), run_id: detail.run_id, version: detail.version }))
+
 /**
- * Subscribes to GET /tickets/{id}/stream. Events arrive live (history first); whenever an
- * agent finishes, the policy overrides, or the status changes, the full ticket is refetched
- * so the cards can show structured results. Mount it once per ticket (key={ticketId}).
+ * Hydrates the full server snapshot before consuming advisory SSE messages. Snapshots stay
+ * authoritative: reconnects and malformed/out-of-order events simply trigger a fresh GET.
  */
 export function useTicketStream(ticketId: number): TicketStream {
   const [detail, setDetail] = useState<TicketDetail | null>(null)
@@ -26,46 +41,105 @@ export function useTicketStream(ticketId: number): TicketStream {
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const refetchTimer = useRef<number | undefined>(undefined)
-  const lastStreamStatus = useRef<TicketStatus | null>(null)
+  const requestSequence = useRef(0)
+  const detailVersion = useRef(-1)
+  const currentRunId = useRef<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
+    const replaceDetail = (next: TicketDetail) => {
+      if (next.version < detailVersion.current) return
+      detailVersion.current = next.version
+      currentRunId.current = next.run_id
+      setDetail(next)
+      setStatus(next.status)
+      // Snapshots (initial fetch, reconnect, and server snapshot events) are authoritative.
+      setEvents(snapshotEvents(next))
+      setError(null)
+    }
+    const fetchDetail = () => {
+      const sequence = ++requestSequence.current
+      api
+        .getTicket(ticketId)
+        .then((next) => {
+          if (!cancelled && sequence === requestSequence.current) replaceDetail(next)
+        })
+        .catch((e: Error) => !cancelled && setError(e.message))
+    }
     const refetch = () => {
       window.clearTimeout(refetchTimer.current)
-      refetchTimer.current = window.setTimeout(() => {
-        api
-          .getTicket(ticketId)
-          .then((d) => {
-            if (!cancelled) {
-              setDetail(d)
-              setStatus(d.status)
-            }
-          })
-          .catch((e: Error) => !cancelled && setError(e.message))
-      }, 120)
+      refetchTimer.current = window.setTimeout(fetchDetail, 120)
     }
-    refetch()
 
+    fetchDetail()
     const source = new EventSource(`${API_URL}/tickets/${ticketId}/stream`)
-    source.onopen = () => setConnected(true)
-    source.onerror = () => setConnected(false) // EventSource reconnects on its own, resuming via Last-Event-ID
+    source.onopen = () => {
+      if (cancelled) return
+      setConnected(true)
+      refetch()
+    }
+    source.onerror = () => {
+      if (!cancelled) setConnected(false)
+    }
 
-    source.addEventListener('event', (e) => {
-      const msg = e as MessageEvent<string>
-      const event: StreamedEvent = { ...(JSON.parse(msg.data) as SwarmEvent), id: Number(msg.lastEventId) }
-      setEvents((prev) => (prev.some((p) => p.id === event.id) ? prev : [...prev, event].sort((a, b) => a.id - b.id)))
-      if (event.status !== 'running' && event.status !== 'tool') refetch()
+    source.addEventListener('snapshot', (message) => {
+      try {
+        const snapshot = JSON.parse((message as MessageEvent<string>).data) as TicketDetail
+        if (snapshot.id !== ticketId || !Number.isInteger(snapshot.version)) throw new Error('Invalid ticket snapshot')
+        replaceDetail(snapshot)
+      } catch {
+        setError('A live snapshot could not be read. Refreshing the ticket state.')
+        refetch()
+      }
     })
 
-    source.addEventListener('status', (e) => {
-      const data = JSON.parse((e as MessageEvent<string>).data) as { status: TicketStatus }
-      // The first status message just reports the current state (after the history replay).
-      // Only a change *into* processing means a re-run, which starts a fresh event list.
-      const previous = lastStreamStatus.current
-      lastStreamStatus.current = data.status
-      if (data.status === 'processing' && previous !== null && previous !== 'processing') setEvents([])
-      setStatus(data.status)
-      refetch()
+    source.addEventListener('reset', refetch)
+    source.addEventListener('event', (message) => {
+      try {
+        const envelope = JSON.parse((message as MessageEvent<string>).data) as Partial<TicketEventEnvelope>
+        const id = Number((message as MessageEvent<string>).lastEventId)
+        if (!Number.isInteger(id) || id < 0 || envelope.ticket_id !== ticketId || !envelope.kind || typeof envelope.timestamp !== 'string') {
+          throw new Error('Invalid ticket event envelope')
+        }
+        if (envelope.run_id && currentRunId.current && envelope.run_id !== currentRunId.current) {
+          refetch()
+          return
+        }
+        // Durable non-agent records (and future event kinds) are represented only by the next snapshot.
+        if (envelope.kind !== 'agent') {
+          // Known status/review/authorization records and unknown future kinds reconcile safely.
+          refetch()
+          return
+        }
+        const data = envelope.data as Partial<SwarmEvent>
+        if (typeof data?.message !== 'string' || typeof data.agent !== 'string' || typeof data.status !== 'string') {
+          throw new Error('Invalid agent event')
+        }
+        const event: StreamedEvent = {
+          ...(data as SwarmEvent),
+          timestamp: data.timestamp ?? envelope.timestamp,
+          id,
+          ticket_id: envelope.ticket_id,
+          run_id: envelope.run_id,
+        }
+        setEvents((previous) => (previous.some((item) => item.id === event.id) ? previous : [...previous, event].sort((a, b) => a.id - b.id)))
+        if (event.status !== 'running' && event.status !== 'tool') refetch()
+      } catch {
+        setError('A live update could not be read. Refreshing the ticket state.')
+        refetch()
+      }
+    })
+
+    source.addEventListener('status', (message) => {
+      try {
+        const data = JSON.parse((message as MessageEvent<string>).data) as { status?: TicketStatus; run_id?: string | null; version?: number }
+        if (!data.status || (data.version !== undefined && data.version < detailVersion.current)) throw new Error('Invalid ticket status')
+        setStatus(data.status)
+        refetch()
+      } catch {
+        setError('A live status update could not be read. Refreshing the ticket state.')
+        refetch()
+      }
     })
 
     return () => {
@@ -76,5 +150,15 @@ export function useTicketStream(ticketId: number): TicketStream {
     }
   }, [ticketId])
 
-  return { detail, events, status, connected, error }
+  const replaceDetail = (next: TicketDetail) => {
+    if (next.version < detailVersion.current) return
+    detailVersion.current = next.version
+    currentRunId.current = next.run_id
+    setDetail(next)
+    setStatus(next.status)
+    setEvents(snapshotEvents(next))
+    setError(null)
+  }
+
+  return { detail, events, status, connected, error, replaceDetail }
 }

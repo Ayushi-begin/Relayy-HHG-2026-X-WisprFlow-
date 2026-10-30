@@ -77,7 +77,7 @@ export function MetricsDashboard({ refreshKey }: { refreshKey: number }) {
         <StatTile
           label="Cost per ticket"
           value={m.cost_per_ticket_usd === null ? '—' : money(m.cost_per_ticket_usd, 4)}
-          sub={`${money(m.total_cost_usd, 2)} total model spend`}
+          sub={`${m.total_cost_usd === null ? 'Cost unavailable' : `${money(m.total_cost_usd, 2)} total model spend`}`}
         />
       </div>
 
@@ -102,11 +102,7 @@ export function MetricsDashboard({ refreshKey }: { refreshKey: number }) {
           />
         </Panel>
         <Panel title="Model spend by agent">
-          <BarList
-            rows={(['triage', 'research', 'action'] as const).map((a) => ({ label: a[0].toUpperCase() + a.slice(1), value: m.cost_by_agent[a] ?? 0 }))}
-            format={(v) => money(v, 4)}
-            empty="No model calls yet"
-          />
+          <CostByAgent costs={m.cost_by_agent} />
         </Panel>
         <Panel title="Human review in Slack">
           <div className="grid grid-cols-3 gap-2 p-4">
@@ -280,6 +276,37 @@ function CategoryChart({ metrics }: { metrics: Metrics }) {
         </Bar>
       </BarChart>
     </ResponsiveContainer>
+  )
+}
+
+function CostByAgent({ costs }: { costs: Metrics['cost_by_agent'] }) {
+  const rows = (['triage', 'research', 'action'] as const).map((agent) => ({
+    label: agent[0].toUpperCase() + agent.slice(1),
+    value: costs[agent] ?? null,
+  }))
+  const max = Math.max(0, ...rows.flatMap((row) => row.value === null ? [] : [row.value]))
+  return (
+    <ul className="space-y-3 p-4">
+      {rows.map((row) => (
+        <li key={row.label}>
+          <div className="mb-1 flex items-baseline justify-between gap-2 text-xs">
+            <span className="truncate text-slate-300">{row.label}</span>
+            <span className="font-mono text-slate-400 tabular-nums">{row.value === null ? 'Cost unavailable' : money(row.value, 4)}</span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.05]">
+            {row.value !== null && max > 0 && (
+              <motion.div
+                className="h-full rounded-full"
+                style={{ background: BAR_COLOR }}
+                initial={{ width: 0 }}
+                animate={{ width: `${(row.value / max) * 100}%` }}
+                transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+              />
+            )}
+          </div>
+        </li>
+      ))}
+    </ul>
   )
 }
 

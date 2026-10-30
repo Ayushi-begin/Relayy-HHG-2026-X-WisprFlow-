@@ -19,7 +19,8 @@ Decisions:
 - auto_resolve: the reply fully answers the customer using the help docs and their records, with no \
 change to their account or money.
 - auto_refund: refund one specific successful payment that the records show was charged in error, \
-consistent with the refund policy. Set refund_amount to that payment's exact amount.
+consistent with the refund policy. Set payment_id and refund_amount_minor to that payment's exact \
+local id and full integer-cent amount. refund_amount is display-only.
 - escalate: anything else, including when a human must act, when you are unsure, or when the records \
 do not support what the customer asks for.
 
@@ -39,12 +40,20 @@ specialist will follow up, and promise no refund or outcome."""
 def _brief(state: TicketState) -> str:
     sections = [llm.ticket_block(state.ticket)]
     if state.triage:
-        sections.append("Triage:\n" + state.triage.model_dump_json(indent=1))
+        sections.append("Triage:\n" + llm.sanitize_model_value(state.triage.model_dump_json(indent=1)))
     if state.research:
-        sections.append("Research:\n" + state.research.model_dump_json(indent=1))
+        sections.append("Research:\n" + llm.sanitize_model_value(state.research.model_dump_json(indent=1)))
     else:
         sections.append("Research: not available.")
-    return "\n\n".join(sections)
+    return llm.sanitize_model_value("\n\n".join(sections))
+
+
+def _payment_fields(payment) -> dict[str, int | float | None]:
+    return {
+        "payment_id": payment.id,
+        "refund_amount_minor": payment.amount_minor,
+        "refund_amount": payment.amount,
+    }
 
 
 def _simulated_proposal(state: TicketState) -> ActionProposal:
@@ -67,7 +76,10 @@ def _simulated_proposal(state: TicketState) -> ActionProposal:
     if category == "refund":
         dupes = tools.find_duplicates(state.research.payments) if state.research else []
         if dupes:
-            refund_val = dupes[0]["amount"]
+            payment = next((p for p in state.research.payments if p.id == dupes[0]["payment_ids"][-1]), None)
+            if payment is None:
+                return _simulated_proposal(TicketState(ticket=state.ticket, triage=state.triage))
+            refund_val = payment.amount or 0.0
             return ActionProposal(
                 decision="auto_refund",
                 reply_draft=(
@@ -82,20 +94,20 @@ def _simulated_proposal(state: TicketState) -> ActionProposal:
                     f"Thanks for reaching out regarding the duplicate charge. A support specialist is reviewing the payment records to process this for you.\n\n"
                     f"Best,\nBrightwave Support"
                 ),
-                refund_amount=refund_val,
+                **_payment_fields(payment),
                 reasoning=f"Identified duplicate charge of ${refund_val:.2f}. Proposing auto-refund.",
                 confidence=0.92,
             )
         # Check if customer has recent payments matching ticket text
         if state.research and state.research.payments:
             p = state.research.payments[0]
-            if p.amount <= 50:
+            if p.amount_minor is not None and p.amount_minor <= 5000:
                 return ActionProposal(
                     decision="auto_refund",
-                    reply_draft=f"Hi {cust_name},\n\nI have confirmed your recent charge of ${p.amount:.2f} and processed a refund to your card. Please allow 3-5 business days for it to appear on your statement.\n\nBest,\nBrightwave Support",
+                    reply_draft=f"Hi {cust_name},\n\nI have confirmed your recent charge of ${(p.amount or 0):.2f} and processed a refund to your card. Please allow 3-5 business days for it to appear on your statement.\n\nBest,\nBrightwave Support",
                     holding_reply=f"Hi {cust_name},\n\nWe have received your refund request. A member of our billing team will review it shortly.\n\nBest,\nBrightwave Support",
-                    refund_amount=p.amount,
-                    reasoning=f"Single charge under limit (${p.amount:.2f}); proposing refund.",
+                    **_payment_fields(p),
+                    reasoning=f"Single charge under limit (${(p.amount or 0):.2f}); proposing refund.",
                     confidence=0.88,
                 )
 
@@ -141,8 +153,10 @@ def _simulated_proposal(state: TicketState) -> ActionProposal:
 async def act(state: TicketState, emit: Callable[[str, str], None]) -> ActionResult:
     proposal: ActionProposal | None = None
 
-    if not config.ANTHROPIC_API_KEY:
-        log.info("No ANTHROPIC_API_KEY set; running simulated proposal generation.")
+    if not config.ANTHROPIC_API_KEY or not MODEL:
+        reason = "model credentials or configured model id unavailable"
+        log.info("%s; running simulated proposal generation.", reason)
+        llm.record_provenance(state.provenance, state.provenance_errors, "action", "simulated", reason)
         proposal = _simulated_proposal(state)
     else:
         try:
@@ -157,8 +171,16 @@ async def act(state: TicketState, emit: Callable[[str, str], None]) -> ActionRes
             )
             llm.record_usage(state.usage, "action", MODEL, response)
             proposal = None if response.stop_reason == "refusal" else response.parsed_output
+            if proposal is None:
+                llm.record_provenance(
+                    state.provenance, state.provenance_errors, "action", "failed", "model refused or produced no action"
+                )
+            else:
+                llm.record_provenance(state.provenance, state.provenance_errors, "action", "real_model")
         except Exception as exc:
-            log.warning("Anthropic API error during action: %s; falling back to simulated proposal.", exc)
+            safe_error = llm.sanitized_error(exc)
+            log.warning("Anthropic API error during action; falling back to simulated proposal: %s", safe_error)
+            llm.record_provenance(state.provenance, state.provenance_errors, "action", "simulated", safe_error)
             proposal = _simulated_proposal(state)
 
     result = policy.enforce(state, proposal)

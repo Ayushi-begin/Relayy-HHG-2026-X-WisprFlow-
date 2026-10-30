@@ -77,6 +77,15 @@ def count_redactions(*texts: str) -> dict[str, int]:
     return total.counts
 
 
+def sanitize_model_text(text: str) -> str:
+    """Apply selected-pattern redaction before text crosses a model boundary.
+
+    This deliberately redacts only the card and phone patterns defined above. It is
+    not a general claim that all personally identifiable information has been removed.
+    """
+    return redact_pii(text).text
+
+
 # --- Manipulation detection ----------------------------------------------------------
 
 _SIGNALS: dict[str, re.Pattern[str]] = {
