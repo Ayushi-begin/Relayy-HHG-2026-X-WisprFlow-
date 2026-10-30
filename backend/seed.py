@@ -17,9 +17,11 @@ Demo scenarios baked in:
 
 import argparse
 import datetime as dt
+import os
 import random
 from dataclasses import dataclass, field
 
+from sqlalchemy import text
 from sqlmodel import Session, SQLModel, func, select
 
 from db import create_db_and_tables, engine
@@ -406,9 +408,15 @@ def seed(reset: bool = False) -> None:
             select(Payment).where(Payment.stripe_charge_id.is_not(None)).limit(1)
         ).first() or session.exec(select(Customer).where(Customer.demo_recipient.is_not(None)).limit(1)).first():
             raise RuntimeError("Refuse reseeding or reset: provider bindings or operation audit records exist.")
+        remote = engine.dialect.name != "sqlite"
+        if remote and reset and os.getenv("RELAYY_ALLOW_REMOTE_RESET") != "1":
+            raise RuntimeError("Refuse resetting a remote database. Set RELAYY_ALLOW_REMOTE_RESET=1 to confirm.")
+        if remote and not reset and session.exec(select(Customer.id).limit(1)).first() is not None:
+            # Fixed seed ids would overwrite existing rows; only seed an empty remote database.
+            raise RuntimeError("Refuse seeding a remote database that already contains customers.")
     if reset:
         SQLModel.metadata.drop_all(engine)
-    SQLModel.metadata.create_all(engine)
+        create_db_and_tables()
 
     data = build(dt.date.today())
     with Session(engine) as session:
@@ -416,6 +424,15 @@ def seed(reset: bool = False) -> None:
         for row in [*data.customers, *data.help_docs, *data.payments, *data.past_tickets, *data.tickets]:
             session.merge(row)
         session.commit()
+        if engine.dialect.name == "postgresql":
+            # Explicit seed ids do not advance Postgres sequences; move them past the seeded rows.
+            for model in (Customer, Payment, Ticket, PastTicket, HelpDoc):
+                table = model.__tablename__
+                session.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                    f"COALESCE((SELECT MAX(id) FROM \"{table}\"), 0) + 1, false)"
+                ))
+            session.commit()
 
         for model in (Customer, Payment, Ticket, PastTicket, HelpDoc):
             count = session.exec(select(func.count()).select_from(model)).one()

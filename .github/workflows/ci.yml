@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests (SQLite + Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relayy
+          POSTGRES_PASSWORD: relayy
+          POSTGRES_DB: relayy_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U relayy -d relayy_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_POSTGRES_URL: postgresql://relayy:relayy@localhost:5432/relayy_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r backend/requirements-dev.txt
+      - run: python -m pytest -q
+      - name: Import check with a Postgres DATABASE_URL
+        working-directory: backend
+        env:
+          DATABASE_URL: ${{ env.TEST_POSTGRES_URL }}
+        run: python -c "import main, db; db.create_db_and_tables(); assert db.ping()"
+
+  frontend:
+    name: Frontend lint, tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+        env:
+          VITE_API_URL: https://api.example.invalid
+
+  docker:
+    name: Backend image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t relayy-api:ci backend
+
+  deploy:
+    name: Deploy (main only, after every check passes)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend, frontend, docker]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trigger Render deploy
+        if: env.RENDER_DEPLOY_HOOK_URL != ''
+        run: curl --fail --silent --show-error -X POST "$RENDER_DEPLOY_HOOK_URL" > /dev/null
+      - uses: actions/setup-node@v4
+        if: env.VERCEL_TOKEN != ''
+        with:
+          node-version: 22
+      - name: Deploy frontend to Vercel
+        if: env.VERCEL_TOKEN != ''
+        working-directory: frontend
+        # Production env vars (VITE_API_URL) come from the Vercel project via `vercel pull`.
+        run: |
+          npx --yes vercel@latest pull --yes --environment=production --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest build --prod --token="$VERCEL_TOKEN"
+          npx --yes vercel@latest deploy --prebuilt --prod --token="$VERCEL_TOKEN"
+      - name: Report skipped deploys
+        if: env.RENDER_DEPLOY_HOOK_URL == '' || env.VERCEL_TOKEN == ''
+        run: echo "::notice::Deploy secrets are not fully configured; see DEPLOYMENT.md. Missing targets were skipped."

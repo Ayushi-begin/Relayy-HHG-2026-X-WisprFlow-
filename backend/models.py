@@ -175,3 +175,25 @@ class TicketEvent(SQLModel, table=True):
     kind: str
     timestamp: dt.datetime
     data: dict = Field(sa_column=Column(JSON))
+
+
+class AgentSetting(SQLModel, table=True):
+    """Operator control over one swarm agent. A disabled agent runs labeled simulated analysis."""
+
+    __tablename__ = "agent_setting"
+    agent: str = Field(primary_key=True)
+    model_enabled: bool = True
+    updated_at: dt.datetime
+    updated_by: str
+
+
+class AuditLog(SQLModel, table=True):
+    """Append-only record of operator mutations. Details never hold credentials or raw ticket text."""
+
+    __tablename__ = "audit_log"
+    id: int | None = Field(default=None, primary_key=True)
+    at: dt.datetime = Field(index=True)
+    actor: str
+    action: str = Field(index=True)
+    target: str
+    detail: dict = Field(default_factory=dict, sa_column=Column(JSON))

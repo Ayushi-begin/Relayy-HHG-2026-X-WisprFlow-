@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, func, select
 
+import audit
 import ticket_service
 from db import engine
 from demo_auth import require_operator
@@ -121,7 +122,7 @@ async def _refresh_slack_review(ticket_id: int, run_id: str, resolution: str | N
 
 
 @router.post("/tickets", status_code=status.HTTP_202_ACCEPTED)
-async def create_ticket(payload: TicketCreate, _: str = Depends(require_operator)) -> TicketAccepted:
+async def create_ticket(payload: TicketCreate, actor: str = Depends(require_operator)) -> TicketAccepted:
     """Create a validated intake and immediately start its first persisted run."""
     subject, body = payload.subject.strip(), payload.body.strip()
     if not subject or not body:
@@ -142,6 +143,10 @@ async def create_ticket(payload: TicketCreate, _: str = Depends(require_operator
         assert customer is not None
         ticket = Ticket(customer_id=customer.id, subject=subject, body=body, created_at=utcnow())
         session.add(ticket)
+        session.flush()
+        # Audit details carry identifiers only, never the untrusted ticket text.
+        audit.record(session, actor=actor, action="ticket.create", target=f"ticket:{ticket.id}",
+                     detail={"customer_id": customer.id})
         session.commit()
         session.refresh(ticket)
     if not ticket_service.start_processing(ticket.id):
@@ -150,12 +155,13 @@ async def create_ticket(payload: TicketCreate, _: str = Depends(require_operator
 
 
 @router.post("/tickets/{ticket_id}/process", status_code=status.HTTP_202_ACCEPTED)
-async def process_ticket(ticket_id: int, background: BackgroundTasks, _: str = Depends(require_operator)) -> TicketAccepted:
+async def process_ticket(ticket_id: int, background: BackgroundTasks, actor: str = Depends(require_operator)) -> TicketAccepted:
     with Session(engine) as session:
         ticket = _get_ticket(session, ticket_id)
         prior_run_id = ticket.current_run_id
     if not ticket_service.start_processing(ticket_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "Ticket has active processing, review, or a delivery operation")
+    audit.record_now(actor=actor, action="ticket.process", target=f"ticket:{ticket_id}", detail={"prior_run_id": prior_run_id})
     if prior_run_id:
         background.add_task(_refresh_slack_review, ticket_id, prior_run_id,
                             "Review superseded by a rerun; review actions are unavailable.")
@@ -178,6 +184,8 @@ def review_ticket(ticket_id: int, payload: HumanReviewRequest, background: Backg
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     if not applied:
         raise HTTPException(status.HTTP_409_CONFLICT, "Review is stale or was already handled; refresh the ticket.")
+    audit.record_now(actor=actor, action=f"ticket.review.{payload.action}", target=f"ticket:{ticket_id}",
+                     detail={"run_id": payload.run_id, "channel": "web"})
     background.add_task(_refresh_slack_review, ticket_id, payload.run_id)
     with Session(engine) as session:
         return _detail(session, _get_ticket(session, ticket_id))
@@ -186,13 +194,15 @@ def review_ticket(ticket_id: int, payload: HumanReviewRequest, background: Backg
 @router.post("/tickets/{ticket_id}/operations/{operation_id}/{action}", response_model=TicketDetail,
              status_code=status.HTTP_202_ACCEPTED)
 def recover_operation(ticket_id: int, operation_id: str, action: Literal["retry", "reconcile"], payload: RecoveryRequest,
-                      _: str = Depends(require_operator)) -> TicketDetail:
+                      actor: str = Depends(require_operator)) -> TicketDetail:
     try:
         ticket_service.request_recovery(ticket_id, operation_id, payload.expected_version, action)
     except KeyError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Ticket or operation not found")
     except ValueError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    audit.record_now(actor=actor, action=f"operation.{action}", target=f"operation:{operation_id}",
+                     detail={"ticket_id": ticket_id})
     with Session(engine) as session:
         return _detail(session, _get_ticket(session, ticket_id))
 
@@ -300,11 +310,47 @@ async def stream_ticket(ticket_id: int, last_event_id: str | None = Header(defau
     })
 
 
+GLOBAL_INITIAL_EVENTS = 50
+GLOBAL_REPLAY_LIMIT = 500
+
+
 @router.get("/events/stream")
-async def stream_all() -> StreamingResponse:
+async def stream_all(last_event_id: str | None = Header(default=None)) -> StreamingResponse:
+    """Global activity: status changes plus every persisted ticket event.
+
+    Event messages carry their durable TicketEvent id, so a reconnecting client resumes with
+    Last-Event-ID and receives what it missed (bounded; a larger gap gets a reset and the most
+    recent events). Status messages are advisory notifications without ids.
+    """
+    try:
+        cursor = int(last_event_id) if last_event_id is not None else None
+    except ValueError:
+        cursor = -1
+
     async def events():
         with bus.subscribe(ALL_TICKETS) as queue:
+            with Session(engine) as session:
+                watermark = session.exec(select(func.max(TicketEvent.id))).one() or 0
+                history: list[TicketEvent] = []
+                reset_reason = None
+                if cursor is not None and 0 <= cursor <= watermark:
+                    history = list(session.exec(select(TicketEvent).where(
+                        TicketEvent.id > cursor, TicketEvent.id <= watermark,
+                    ).order_by(TicketEvent.id).limit(GLOBAL_REPLAY_LIMIT + 1)).all())
+                    if len(history) > GLOBAL_REPLAY_LIMIT:
+                        reset_reason, history = "replay_truncated", []
+                elif cursor is not None:
+                    reset_reason = "obsolete_cursor"
+                if cursor is None or reset_reason:
+                    history = list(reversed(session.exec(select(TicketEvent).where(
+                        TicketEvent.id <= watermark,
+                    ).order_by(TicketEvent.id.desc()).limit(GLOBAL_INITIAL_EVENTS)).all()))
             yield ": connected\n\n"
+            if reset_reason:
+                yield _sse(Message("reset", {"reason": reset_reason}))
+            for event in history:
+                yield _sse(_event_message(event))
+            last_sent = watermark
             while True:
                 try:
                     message = await asyncio.wait_for(queue.get(), HEARTBEAT_SECONDS)
@@ -312,7 +358,12 @@ async def stream_all() -> StreamingResponse:
                     yield ": heartbeat\n\n"
                     continue
                 if message.kind == "reset":
+                    yield _sse(message)
                     return
+                if message.id is not None:
+                    if message.id <= last_sent:
+                        continue
+                    last_sent = message.id
                 yield _sse(message)
     return StreamingResponse(events(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "X-Accel-Buffering": "no",

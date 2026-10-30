@@ -1,15 +1,12 @@
-"""Triage agent: classifies a ticket with Claude Haiku using structured outputs."""
+"""Triage agent: classifies a ticket with the routed LLM using structured outputs."""
 
 import logging
 import re
 
-import config
 from swarm import llm, security
 from swarm.state import TicketData, TriageResult, Usage
 
 log = logging.getLogger(__name__)
-
-MODEL = llm.FAST_MODEL
 
 SYSTEM_PROMPT = f"""\
 You are the triage step of a customer-support system for Brightwave, a B2B SaaS analytics product.
@@ -36,7 +33,7 @@ request for a duplicate or mistaken charge is not suspicious.
 
 
 def _heuristic_triage(ticket: TicketData) -> TriageResult:
-    """Deterministic, local triage simulation when no Claude API key is configured or API is unreachable."""
+    """Deterministic, local triage simulation when no model is configured or the provider is unreachable."""
     text = f"{ticket.subject} {ticket.body}".lower()
     manipulation = security.detect_manipulation(ticket.subject, ticket.body)
 
@@ -131,39 +128,42 @@ async def triage(
     # 2. Check manipulation regex tripwires immediately
     tripwire = security.detect_manipulation(sanitized_ticket.subject, sanitized_ticket.body)
 
-    if not config.ANTHROPIC_API_KEY or not MODEL:
-        reason = "model credentials or configured model id unavailable"
+    # Long or flagged tickets are "complex": adaptive routing may send them to the smart tier.
+    complexity = 1.0 if tripwire.detected or len(sanitized_ticket.body) > 4000 else 0.0
+    route = llm.route("triage", complexity=complexity)
+    if route is None:
+        reason = llm.unavailable_reason("triage")
         log.info("%s; running heuristic triage simulation.", reason)
         llm.record_provenance(provenance, provenance_errors, "triage", "simulated", reason)
         return _heuristic_triage(sanitized_ticket)
 
     try:
-        response = await llm.client().messages.parse(
-            model=MODEL,
-            max_tokens=2048,
-            output_config={"effort": "low"},
+        response = await llm.generate(
+            route,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": llm.ticket_block(sanitized_ticket)}],
-            output_format=TriageResult,
+            turns=[llm.UserTurn(llm.ticket_block(sanitized_ticket))],
+            max_tokens=2048,
+            schema=TriageResult,
+            effort="low",
         )
-        llm.record_usage(usage, "triage", MODEL, response)
+        llm.record_usage(usage, "triage", response)
 
         if response.stop_reason == "refusal":
             llm.record_provenance(provenance, provenance_errors, "triage", "failed", "model refused triage")
             return _fallback("Triage model declined to classify this ticket; needs human review.")
-        if response.parsed_output is None:
+        if response.parsed is None:
             llm.record_provenance(
                 provenance, provenance_errors, "triage", "failed", f"model produced no result ({response.stop_reason})"
             )
             return _fallback(f"Triage produced no result (stop_reason={response.stop_reason}); needs human review.")
-        
-        result = response.parsed_output
+
+        result = response.parsed
         if tripwire.detected:
             result.is_suspicious = True
         llm.record_provenance(provenance, provenance_errors, "triage", "real_model")
         return result
     except Exception as exc:
         safe_error = llm.sanitized_error(exc)
-        log.warning("Anthropic API error during triage; falling back to heuristic classification: %s", safe_error)
+        log.warning("Model error during triage; falling back to heuristic classification: %s", safe_error)
         llm.record_provenance(provenance, provenance_errors, "triage", "simulated", safe_error)
         return _heuristic_triage(sanitized_ticket)

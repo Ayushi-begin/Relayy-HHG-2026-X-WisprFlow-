@@ -26,7 +26,7 @@ const SERIES: { key: Decision; label: string; color: string }[] = [
 ]
 const BAR_COLOR = '#3987e5'
 const AXIS = '#898781'
-const GRID = 'rgba(255,255,255,0.06)'
+const GRID = 'var(--t-grid)'
 
 export function MetricsDashboard({ refreshKey }: { refreshKey: number }) {
   const [metrics, setMetrics] = useState<Metrics | null>(null)
@@ -261,7 +261,7 @@ function CategoryChart({ metrics }: { metrics: Metrics }) {
         <XAxis dataKey="category" tick={{ fill: AXIS, fontSize: 11 }} axisLine={{ stroke: GRID }} tickLine={false} />
         <YAxis allowDecimals={false} tick={{ fill: AXIS, fontSize: 11 }} axisLine={false} tickLine={false} />
         <Tooltip
-          cursor={{ fill: 'rgba(255,255,255,0.04)' }}
+          cursor={{ fill: 'var(--t-grid)' }}
           content={({ active, payload }) =>
             active && payload?.length ? (
               <ChartTooltip
@@ -272,7 +272,7 @@ function CategoryChart({ metrics }: { metrics: Metrics }) {
           }
         />
         <Bar dataKey="count" fill={BAR_COLOR} radius={[4, 4, 0, 0]} maxBarSize={44} animationDuration={500}>
-          <LabelList dataKey="count" position="top" fill="#cbd5e1" fontSize={11} />
+          <LabelList dataKey="count" position="top" fill="var(--t-slate-300)" fontSize={11} />
         </Bar>
       </BarChart>
     </ResponsiveContainer>

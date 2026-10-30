@@ -1,13 +1,10 @@
 import logging
 from collections.abc import Callable
 
-import config
 from swarm import llm, policy, tools
 from swarm.state import ActionProposal, ActionResult, TicketState
 
 log = logging.getLogger(__name__)
-
-MODEL = llm.SMART_MODEL
 
 SYSTEM_PROMPT = f"""\
 You are the action step of a customer-support system for Brightwave, a B2B SaaS analytics product. \
@@ -57,7 +54,7 @@ def _payment_fields(payment) -> dict[str, int | float | None]:
 
 
 def _simulated_proposal(state: TicketState) -> ActionProposal:
-    """Generate a realistic proposal based on triage and research findings when Claude API is not configured."""
+    """Generate a realistic proposal based on triage and research findings when no model is configured."""
     cust_name = state.research.customer.name.split()[0] if state.research and state.research.customer else "there"
     category = state.triage.category if state.triage else "other"
     is_suspicious = state.triage.is_suspicious if state.triage else False
@@ -153,24 +150,26 @@ def _simulated_proposal(state: TicketState) -> ActionProposal:
 async def act(state: TicketState, emit: Callable[[str, str], None]) -> ActionResult:
     proposal: ActionProposal | None = None
 
-    if not config.ANTHROPIC_API_KEY or not MODEL:
-        reason = "model credentials or configured model id unavailable"
+    route = llm.route("action")
+    if route is None:
+        reason = llm.unavailable_reason("action")
         log.info("%s; running simulated proposal generation.", reason)
         llm.record_provenance(state.provenance, state.provenance_errors, "action", "simulated", reason)
         proposal = _simulated_proposal(state)
     else:
         try:
-            response = await llm.client().beta.messages.parse(
-                model=MODEL,
-                max_tokens=16000,
-                output_config={"effort": "medium"},
+            response = await llm.generate(
+                route,
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": _brief(state)}],
-                output_format=ActionProposal,
-                **llm.FALLBACK,
+                turns=[llm.UserTurn(_brief(state))],
+                max_tokens=16000,
+                schema=ActionProposal,
+                effort="medium",
             )
-            llm.record_usage(state.usage, "action", MODEL, response)
-            proposal = None if response.stop_reason == "refusal" else response.parsed_output
+            llm.record_usage(state.usage, "action", response)
+            # The proposal is model output: it is schema-validated here and policy-checked below,
+            # and it can never authorize a provider effect on its own.
+            proposal = None if response.stop_reason == "refusal" else response.parsed
             if proposal is None:
                 llm.record_provenance(
                     state.provenance, state.provenance_errors, "action", "failed", "model refused or produced no action"
@@ -179,7 +178,7 @@ async def act(state: TicketState, emit: Callable[[str, str], None]) -> ActionRes
                 llm.record_provenance(state.provenance, state.provenance_errors, "action", "real_model")
         except Exception as exc:
             safe_error = llm.sanitized_error(exc)
-            log.warning("Anthropic API error during action; falling back to simulated proposal: %s", safe_error)
+            log.warning("Model error during action; falling back to simulated proposal: %s", safe_error)
             llm.record_provenance(state.provenance, state.provenance_errors, "action", "simulated", safe_error)
             proposal = _simulated_proposal(state)
 

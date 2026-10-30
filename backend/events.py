@@ -37,8 +37,9 @@ class EventBus:
         self._lock = threading.Lock()
 
     def publish_ticket_event(self, ticket_id: int, event_id: int, data: dict[str, Any]) -> None:
-        payload = {"ticket_id": ticket_id, **data}
-        self._publish(ticket_id, Message("event", payload, event_id))
+        message = Message("event", {"ticket_id": ticket_id, **data}, event_id)
+        self._publish(ticket_id, message)
+        self._publish(ALL_TICKETS, message)
 
     def publish_status(
         self, ticket_id: int, status: str, resolution: str | None = None, *, run_id: str | None = None,

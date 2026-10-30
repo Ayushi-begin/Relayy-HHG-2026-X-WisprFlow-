@@ -1,0 +1,68 @@
+# Render Blueprint for the Relayy API. See DEPLOYMENT.md for the full walkthrough.
+# Values marked `sync: false` are prompted for once when the Blueprint is created; set or
+# change them later in the Render dashboard. Never commit real values to this file.
+services:
+  - type: web
+    name: relayy-api
+    runtime: python
+    rootDir: backend
+    plan: free  # spins down when idle and is not meant for production; pick a paid plan for real traffic
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    # Single process on purpose: the SSE bus, rate limiter and delivery worker are in-process.
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    healthCheckPath: /api/ready
+    # GitHub Actions triggers the deploy hook only after tests pass (see .github/workflows/ci.yml).
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.14.8
+      # Neon pooled connection string (host contains "-pooler"), with sslmode=require.
+      - key: DATABASE_URL
+        sync: false
+      # Neon direct (non-pooled) connection string, used only for migrations at startup.
+      - key: MIGRATION_DATABASE_URL
+        sync: false
+      # Your Vercel production origin, e.g. https://relayy.vercel.app (comma-separate several).
+      - key: FRONTEND_ORIGINS
+        sync: false
+      # Required for every web mutation; read it in the dashboard to unlock the UI.
+      - key: DEMO_OPERATOR_TOKEN
+        generateValue: true
+      - key: DEMO_OPERATOR_NAME
+        value: operator
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_ROUTING
+        value: static
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_FAST_MODEL
+        sync: false
+      - key: GEMINI_SMART_MODEL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_FAST_MODEL
+        sync: false
+      - key: ANTHROPIC_SMART_MODEL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_FAST_MODEL
+        sync: false
+      - key: OPENAI_SMART_MODEL
+        sync: false
+      # External effects stay off until test fixtures and recipients are verified.
+      - key: DELIVERY_MODE
+        value: disabled
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_CHANNEL_ID
+        sync: false
+      - key: SLACK_ALLOWED_TEAM_ID
+        sync: false
+      - key: SLACK_ALLOWED_REVIEWERS
+        sync: false

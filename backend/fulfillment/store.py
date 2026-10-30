@@ -6,7 +6,7 @@ import json
 import uuid
 
 from sqlalchemy import update
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.dialects import postgresql, sqlite
 from sqlmodel import Session, select
 
 from models import DeliveryOperation, OperationAttempt
@@ -37,6 +37,7 @@ def freeze(session: Session, *, ticket_id: int, run_id: str, kind: str, request:
         created_at=now(), updated_at=now(),
     )
     # The uniqueness constraint is the final arbiter across simultaneous tickets.
+    insert = postgresql.insert if session.get_bind().dialect.name == "postgresql" else sqlite.insert
     session.exec(insert(DeliveryOperation).values(**operation.model_dump()).on_conflict_do_nothing())
     saved = session.exec(select(DeliveryOperation).where(DeliveryOperation.logical_key == logical_key)).one()
     if saved.ticket_id != ticket_id or saved.run_id != run_id or saved.request_hash != operation.request_hash:

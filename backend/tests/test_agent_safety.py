@@ -1,8 +1,8 @@
 import asyncio
 import datetime as dt
-from types import SimpleNamespace
-
 from swarm import llm, tools
+from swarm.providers.base import LLMResponse, ProviderError, TokenUsage, ToolCall
+from swarm.providers.router import Route
 from swarm.action import _brief as action_brief
 from swarm.research import _brief as research_brief
 from swarm.state import ResearchResult, TicketData, TicketState, TriageResult
@@ -56,7 +56,7 @@ def test_tool_text_is_sanitized_before_returning_to_model(monkeypatch):
 def test_missing_model_configuration_records_simulated_provenance(monkeypatch):
     import swarm.triage as triage_module
 
-    monkeypatch.setattr(triage_module.config, "ANTHROPIC_API_KEY", "")
+    monkeypatch.setattr(triage_module.llm, "route", lambda *_args, **_kwargs: None)
     provenance, errors = {}, {}
     result = asyncio.run(triage(ticket("Need help"), provenance=provenance, provenance_errors=errors))
     assert result.confidence > 0
@@ -65,16 +65,14 @@ def test_missing_model_configuration_records_simulated_provenance(monkeypatch):
 
 
 def test_unknown_model_pricing_is_unavailable():
-    class Response:
-        class usage:
-            input_tokens = 2
-            output_tokens = 3
-            cache_read_input_tokens = 0
-            cache_creation_input_tokens = 0
-
+    response = LLMResponse(
+        provider="gemini", model="unverified-model", text="", tool_calls=[], stop_reason="end",
+        usage=TokenUsage(input_tokens=2, output_tokens=3),
+    )
     usage = []
-    llm.record_usage(usage, "triage", "unverified-model", Response())
+    llm.record_usage(usage, "triage", response)
     assert usage[0].cost_usd is None
+    assert usage[0].provider == "gemini"
 
 
 def test_model_exception_provenance_omits_provider_body_and_credentials():
@@ -85,21 +83,23 @@ def test_model_exception_provenance_omits_provider_body_and_credentials():
     assert "4111" not in safe
 
 
+def test_normalized_provider_error_provenance_keeps_only_fixed_classification():
+    safe = llm.sanitized_error(ProviderError("anthropic", "http_429", transient=True))
+    assert safe == "Model provider request failed (anthropic: http_429)"
+
+
 def test_research_tool_budget_exhaustion_is_failed_not_real_model(monkeypatch):
     import swarm.research as research_module
 
-    class FakeMessages:
-        async def create(self, **_kwargs):
-            return SimpleNamespace(
-                usage=None,
-                stop_reason="tool_use",
-                content=[SimpleNamespace(type="tool_use", name="unknown", input={}, id="tool-call")],
-            )
+    async def fake_generate(_route, **_kwargs):
+        return LLMResponse(
+            provider="gemini", model="configured-model", text="", stop_reason="tool_use", usage=None,
+            tool_calls=[ToolCall(id="tool-call", name="unknown", input={})],
+        )
 
-    fake_client = SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages()))
-    monkeypatch.setattr(research_module.config, "ANTHROPIC_API_KEY", "configured-for-test")
-    monkeypatch.setattr(research_module, "MODEL", "configured-model")
-    monkeypatch.setattr(research_module.llm, "client", lambda: fake_client)
+    route = Route("research", "gemini", "configured-model", "smart", "test")
+    monkeypatch.setattr(research_module.llm, "route", lambda *_args, **_kwargs: route)
+    monkeypatch.setattr(research_module.llm, "generate", fake_generate)
     monkeypatch.setattr(research_module.tools, "lookup_customer", lambda _ctx, _customer_id: None)
 
     state = TicketState(ticket=ticket("Please investigate my billing issue"))

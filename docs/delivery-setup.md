@@ -41,8 +41,8 @@ Store credentials through secure secret configuration or a local ignored `.env`.
 
 | Setting | Requirement |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Account access and credits for a real-model demonstration. |
-| `ANTHROPIC_FAST_MODEL`, `ANTHROPIC_SMART_MODEL` | Explicit account-supported model IDs. There is no guessed default. |
+| `GEMINI_API_KEY` | Account access and credits for a real-model demonstration. |
+| `GEMINI_FAST_MODEL`, `GEMINI_SMART_MODEL` | Explicit account-supported Gemini model IDs. |
 | `DELIVERY_MODE` | Set to `test` only after fixture setup and safe configuration. |
 | `DEMO_OPERATOR_TOKEN` | A dedicated random token with at least 32 characters. |
 | `RESEND_API_KEY` | A dedicated demo-account key with send and email-retrieval permissions. |

@@ -1,6 +1,9 @@
 fastapi>=0.115
 uvicorn[standard]>=0.32
-anthropic>=0.40
+google-genai>=1.0
+anthropic>=2.3,<3
+openai>=3.41,<4
 python-dotenv>=1.0
 sqlmodel>=0.0.22
 httpx>=0.28
+psycopg[binary]>=3.2,<4

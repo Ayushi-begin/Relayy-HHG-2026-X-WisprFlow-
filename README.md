@@ -11,7 +11,7 @@ Use [provider setup and recovery](docs/delivery-setup.md) for the current implem
 Real-provider verification remains separate from offline test results.
 
 ```
-backend/    Python 3.11 · FastAPI · uvicorn · Anthropic SDK · SQLModel (SQLite)
+backend/    Python 3.11 · FastAPI · uvicorn · Gemini SDK · SQLModel (SQLite)
 frontend/   React · Vite · TypeScript · Tailwind CSS
 ```
 
@@ -30,7 +30,7 @@ cp .env.example .env
 
 | Variable               | Purpose                                     |
 | ---------------------- | ------------------------------------------- |
-| `ANTHROPIC_API_KEY`    | Claude API key                              |
+| `GEMINI_API_KEY`       | Gemini API key                              |
 | `SLACK_WEBHOOK_URL`    | Incoming webhook for posting to a channel   |
 | `SLACK_SIGNING_SECRET` | Verifies requests sent by Slack             |
 | `SLACK_BOT_TOKEN`      | Bot token (`xoxb-...`) for the Slack Web API |
@@ -79,15 +79,15 @@ Tables include `customer`, `payment`, `ticket`, `past_ticket`, `help_doc`, `tick
 
 | Step     | Model               | What it does |
 | -------- | ------------------- | ------------ |
-| Triage   | `ANTHROPIC_FAST_MODEL`  | Classifies the ticket (category, urgency, sentiment, language, whether it's suspicious) |
-| Research | `ANTHROPIC_SMART_MODEL` | Calls up to 6 rounds of read-only database tools (`swarm/tools.py`): customer lookup, payments, past tickets, and keyword (BM25) search over the help docs. Produces `key_findings` |
-| Action   | `ANTHROPIC_SMART_MODEL` | Proposes a decision (`auto_resolve` / `auto_refund` / `escalate`) and drafts a reply. `swarm/policy.py` then applies hard rules in Python |
+| Triage   | `GEMINI_FAST_MODEL`  | Classifies the ticket (category, urgency, sentiment, language, whether it's suspicious) |
+| Research | `GEMINI_SMART_MODEL` | Calls up to 6 rounds of read-only database tools (`swarm/tools.py`): customer lookup, payments, past tickets, and keyword (BM25) search over the help docs. Produces `key_findings` |
+| Action   | `GEMINI_SMART_MODEL` | Proposes a decision (`auto_resolve` / `auto_refund` / `escalate`) and drafts a reply. `swarm/policy.py` then applies hard rules in Python |
 
 The policy rules force `escalate` when the ticket is flagged suspicious, its urgency is critical, the customer is a VIP and angry, either model's confidence is below 0.75, or the model proposes a refund over $50 or one that doesn't match a successful payment. Every rule that fired is recorded in `action.rules_fired`.
 
 The research tools require a trusted customer scope. Missing scope fails closed. Refunds additionally require one exact owned USD test charge, integer cents, verified eligibility evidence, and real-model provenance. Monthly charges and enterprise refunds do not auto-refund. Selected card/phone patterns are sanitized at every model boundary; this is not complete PII removal.
 
-To try triage on 5 sample tickets (needs `ANTHROPIC_API_KEY` in `.env`):
+To try triage on 5 sample tickets (needs `GEMINI_API_KEY` in `.env`):
 
 ```bash
 cd backend

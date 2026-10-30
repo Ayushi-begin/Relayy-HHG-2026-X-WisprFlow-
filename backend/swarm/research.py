@@ -1,19 +1,16 @@
-"""Research agent: gathers customer context with Claude Sonnet and read-only DB tools."""
+"""Research agent: gathers customer context with the routed LLM and read-only DB tools."""
 
 import datetime as dt
-import json
 import logging
 from collections.abc import Callable
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
-import config
 from swarm import llm, tools
 from swarm.state import ResearchResult, TicketState
 
 log = logging.getLogger(__name__)
 
-MODEL = llm.SMART_MODEL
 MAX_ITERATIONS = 6  # model calls per ticket
 
 SYSTEM_PROMPT = f"""\
@@ -47,15 +44,7 @@ class ResearchNotes(BaseModel):
     key_findings: list[str]
 
 
-NOTES_FORMAT = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {"key_findings": {"type": "array", "items": {"type": "string"}}},
-        "required": ["key_findings"],
-        "additionalProperties": False,
-    },
-}
+TOOL_SPECS = tuple(llm.ToolSpec(t["name"], t["description"], t["input_schema"]) for t in tools.TOOLS)
 
 Emit = Callable[[str, str], None]  # (status, message)
 
@@ -75,14 +64,9 @@ def _brief(state: TicketState) -> str:
     return llm.sanitize_model_value("\n".join(lines)) + "\n\n" + llm.ticket_block(t)
 
 
-def _parse_notes(response) -> list[str] | None:
-    text = next((b.text for b in reversed(response.content) if b.type == "text"), None)
-    if text is None:
-        return None
-    try:
-        return ResearchNotes.model_validate(json.loads(text)).key_findings
-    except (json.JSONDecodeError, ValidationError):
-        return None
+def _parse_notes(response: llm.LLMResponse) -> list[str] | None:
+    notes = response.parsed
+    return notes.key_findings if isinstance(notes, ResearchNotes) else None
 
 
 def _fallback_findings(ctx: tools.ToolContext) -> list[str]:
@@ -99,7 +83,7 @@ def _fallback_findings(ctx: tools.ToolContext) -> list[str]:
 
 
 async def _simulated_research(state: TicketState, emit: Emit, ctx: tools.ToolContext) -> ResearchResult:
-    """Run local database tools deterministically when Anthropic API is not available."""
+    """Run local database tools deterministically when no model is configured or the provider is unreachable."""
     cid = ctx.allowed_customer_id
     # 1. Lookup customer
     if cid is not None:
@@ -155,36 +139,36 @@ async def _simulated_research(state: TicketState, emit: Emit, ctx: tools.ToolCon
 async def research(state: TicketState, emit: Emit) -> ResearchResult:
     ctx = tools.ToolContext(allowed_customer_id=state.ticket.customer_id)
 
-    if not config.ANTHROPIC_API_KEY or not MODEL:
-        reason = "model credentials or configured model id unavailable"
+    route = llm.route("research")
+    if route is None:
+        reason = llm.unavailable_reason("research")
         log.info("%s; running simulated local tool execution.", reason)
         llm.record_provenance(state.provenance, state.provenance_errors, "research", "simulated", reason)
         return await _simulated_research(state, emit, ctx)
 
-    messages: list[dict] = [{"role": "user", "content": _brief(state)}]
+    turns: list = [llm.UserTurn(_brief(state))]
     findings: list[str] | None = None
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
-            response = await llm.client().beta.messages.create(
-                model=MODEL,
-                max_tokens=16000,
-                output_config={"effort": "medium", "format": NOTES_FORMAT},
+            response = await llm.generate(
+                route,
                 system=SYSTEM_PROMPT,
-                tools=tools.TOOLS,
-                messages=messages,
-                **llm.FALLBACK,
+                turns=turns,
+                max_tokens=16000,
+                schema=ResearchNotes,
+                tools=TOOL_SPECS,
+                effort="medium",
             )
-            llm.record_usage(state.usage, "research", MODEL, response)
+            llm.record_usage(state.usage, "research", response)
             if response.stop_reason == "refusal":
                 emit("error", "Research model declined this ticket.")
                 llm.record_provenance(state.provenance, state.provenance_errors, "research", "failed", "model refused research")
                 break
 
             # Pass the assistant turn back unchanged (thinking blocks included); history stays append-only.
-            messages.append({"role": "assistant", "content": response.content})
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
-            if not tool_uses:
+            turns.append(llm.AssistantTurn(response))
+            if not response.tool_calls:
                 findings = _parse_notes(response)
                 if findings is None:
                     llm.record_provenance(
@@ -203,18 +187,17 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
                 break
 
             results = []
-            for call in tool_uses:
+            for call in response.tool_calls:
                 emit("tool", tools.describe_call(call.name, call.input))
                 output, is_error = tools.execute(ctx, call.name, call.input)
                 if is_error:
                     emit("tool", f"⚠️ {call.name}: {output}")
-                results.append({"type": "tool_result", "tool_use_id": call.id, "content": output, "is_error": is_error})
-            if iteration == MAX_ITERATIONS - 1:
-                results.append({"type": "text", "text": BUDGET_NOTE})
-            messages.append({"role": "user", "content": results})
+                results.append(llm.ToolResult(call.id, call.name, output, is_error))
+            note = BUDGET_NOTE if iteration == MAX_ITERATIONS - 1 else None
+            turns.append(llm.ToolResultsTurn(tuple(results), note))
     except Exception as exc:
         safe_error = llm.sanitized_error(exc)
-        log.warning("Anthropic API error during research; falling back to local database tools: %s", safe_error)
+        log.warning("Model error during research; falling back to local database tools: %s", safe_error)
         llm.record_provenance(state.provenance, state.provenance_errors, "research", "simulated", safe_error)
         return await _simulated_research(state, emit, ctx)
 

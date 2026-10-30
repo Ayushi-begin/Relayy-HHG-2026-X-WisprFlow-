@@ -130,6 +130,8 @@ class Usage(BaseModel):
 
     agent: AgentName
     model: str
+    provider: str | None = None  # absent on records written before multi-provider support
+    latency_ms: int | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_input_tokens: int = 0

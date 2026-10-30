@@ -1,14 +1,15 @@
 """Quick live check of the triage agent against 5 sample tickets.
 
-Run from backend/ (needs ANTHROPIC_API_KEY in the root .env):
+Run from backend/ (needs LLM_PROVIDER, its API key and model IDs in the root .env):
     python -m swarm.test_triage
 """
 
 import asyncio
 import sys
 
+from swarm import llm
 from swarm.state import TicketData, TriageResult
-from swarm.triage import MODEL, triage
+from swarm.triage import triage
 
 # (ticket, expected categories, expected is_suspicious)
 SAMPLES: list[tuple[TicketData, set[str], bool]] = [
@@ -71,8 +72,15 @@ def check(result: TriageResult, categories: set[str], suspicious: bool) -> list[
 
 
 async def main() -> int:
-    print(f"Triage model: {MODEL}\n")
-    results = await asyncio.gather(*(triage(t) for t, _, _ in SAMPLES), return_exceptions=True)
+    route = llm.route("triage")
+    if route is None:
+        print("No triage model is configured; a live check cannot run (simulated results are not evidence).")
+        return 2
+    print(f"Triage route: {route.provider}:{route.model} ({route.reason})\n")
+    provenances: list[dict[str, str]] = [{} for _ in SAMPLES]
+    results = await asyncio.gather(
+        *(triage(t, provenance=prov) for (t, _, _), prov in zip(SAMPLES, provenances)), return_exceptions=True
+    )
 
     failures = 0
     for i, ((ticket, categories, suspicious), result) in enumerate(zip(SAMPLES, results), start=1):
@@ -87,6 +95,8 @@ async def main() -> int:
         )
         print(f"    {result.summary}")
         problems = check(result, categories, suspicious)
+        if provenances[i - 1].get("triage") != "real_model":
+            problems.append(f"not a real model result ({provenances[i - 1].get('triage')})")
         print(f"    {'PASS' if not problems else 'FAIL  ' + '; '.join(problems)}\n")
         failures += bool(problems)
 

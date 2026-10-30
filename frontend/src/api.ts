@@ -269,4 +269,96 @@ export const api = {
       body: JSON.stringify({ expected_version: expectedVersion }),
     }),
   metrics: () => request<Metrics>('/metrics'),
+  agents: () => request<AgentInfo[]>('/agents'),
+  updateAgent: (agent: string, modelEnabled: boolean, token: string) =>
+    request<AgentInfo>(`/agents/${agent}/settings`, {
+      method: 'POST',
+      headers: operatorHeaders(token),
+      body: JSON.stringify({ model_enabled: modelEnabled }),
+    }),
+  providers: () => request<ProvidersInfo>('/api/providers'),
+  audit: (token: string) => request<AuditEntry[]>('/audit?limit=50', { headers: operatorHeaders(token) }),
+}
+
+export interface RouteInfo {
+  agent: string
+  provider: string
+  model: string
+  tier: 'fast' | 'smart'
+  reason: string
+}
+
+export interface AgentExecution {
+  ticket_id: number
+  run_id: string
+  run_number: number
+  started_at: string
+  provenance: StageProvenance
+  error: string | null
+  calls: number
+  latency_ms: number | null
+  model: string | null
+  provider: string | null
+}
+
+export interface AgentInfo {
+  id: StageName
+  name: string
+  role: string
+  description: string
+  inputs: string[]
+  outputs: string[]
+  tools: string[]
+  tier: 'fast' | 'smart'
+  model_enabled: boolean
+  updated_at: string | null
+  updated_by: string | null
+  route: RouteInfo | null
+  mode: 'live' | 'simulated'
+  unavailable_reason: string | null
+  stats: {
+    runs: number
+    real_model: number
+    simulated: number
+    failed: number
+    calls: number
+    input_tokens: number
+    output_tokens: number
+    cost_usd: number | null
+    success_rate: number | null
+    avg_latency_ms: number | null
+    models: Record<string, number>
+    last_run_at: string | null
+    recent: AgentExecution[]
+    decisions?: Record<string, number>
+  }
+}
+
+export interface ProviderHealth {
+  calls: number
+  successes: number
+  failures: number
+  consecutive_failures: number
+  avg_latency_ms: number | null
+  last_latency_ms: number | null
+  last_error: string | null
+  status: 'ok' | 'degraded' | 'open'
+}
+
+export interface ProvidersInfo {
+  default_provider: string
+  routing: string
+  fallback_provider: string | null
+  providers: Record<string, { configured: boolean; models: { fast: string; smart: string } }>
+  routes: Record<string, RouteInfo | null>
+  health: Record<string, ProviderHealth>
+}
+
+export interface AuditEntry {
+  id: number
+  at: string
+  actor: string
+  action: string
+  target: string
+  detail: Record<string, unknown>
 }

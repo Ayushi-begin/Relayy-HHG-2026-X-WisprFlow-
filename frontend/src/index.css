@@ -1,13 +1,63 @@
 @import "tailwindcss";
 
-@theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+/* Components use Tailwind's slate/white/cyan names; they resolve to the active theme's tokens,
+   which src/theme/preferences.tsx writes onto <html>. Defaults below match the Dark theme. */
+@theme inline {
+  --font-sans: var(--t-font);
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-white: var(--t-white);
+  --color-slate-50: var(--t-slate-50);
+  --color-slate-100: var(--t-slate-100);
+  --color-slate-200: var(--t-slate-200);
+  --color-slate-300: var(--t-slate-300);
+  --color-slate-400: var(--t-slate-400);
+  --color-slate-500: var(--t-slate-500);
+  --color-slate-600: var(--t-slate-600);
+  --color-slate-700: var(--t-slate-700);
+  --color-slate-800: var(--t-slate-800);
+  --color-slate-900: var(--t-slate-900);
+  --color-slate-950: var(--t-slate-950);
+  --color-cyan-200: var(--t-accent-200);
+  --color-cyan-300: var(--t-accent-300);
+  --color-cyan-400: var(--t-accent-400);
+  --color-cyan-500: var(--t-accent-500);
+  --color-accent: var(--t-accent);
+  --color-on-accent: var(--t-on-accent);
+  --color-page: var(--t-bg);
+  --color-header: var(--t-header);
 }
 
 :root {
   color-scheme: dark;
-  --page: #080c13;
+  --t-bg: #0a0e15;
+  --t-fg: #e6edf6;
+  --t-white: #e6edf6;
+  --t-header: #0f141c;
+  --t-glow: rgba(34, 211, 238, 0.08);
+  --t-grid: rgba(255, 255, 255, 0.03);
+  --t-accent: #22d3ee;
+  --t-accent-200: #a5f3fc;
+  --t-accent-300: #67e8f9;
+  --t-accent-400: #22d3ee;
+  --t-accent-500: #06b6d4;
+  --t-on-accent: #0a0e15;
+  --t-font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --t-slate-50: #f8fafc;
+  --t-slate-100: #f1f5f9;
+  --t-slate-200: #e2e8f0;
+  --t-slate-300: #cbd5e1;
+  --t-slate-400: #94a3b8;
+  --t-slate-500: #64748b;
+  --t-slate-600: #475569;
+  --t-slate-700: #334155;
+  --t-slate-800: #1e293b;
+  --t-slate-900: #0f172a;
+  --t-slate-950: #020617;
+}
+
+/* Compact density tightens Tailwind's spacing unit everywhere. */
+:root[data-density="compact"] {
+  --spacing: 0.21rem;
 }
 
 html,
@@ -18,26 +68,51 @@ body,
 
 body {
   margin: 0;
-  background-color: var(--page);
-  /* Soft glows plus a faint grid: the "mission control" backdrop. */
+  background-color: var(--t-bg);
   background-image:
-    radial-gradient(60rem 30rem at 15% -10%, rgba(34, 211, 238, 0.08), transparent 60%),
-    radial-gradient(50rem 30rem at 100% 0%, rgba(139, 92, 246, 0.08), transparent 60%),
-    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px);
-  background-size: auto, auto, 32px 32px, 32px 32px;
-  color: #e2e8f0;
-  font-family: var(--font-sans);
+    radial-gradient(60rem 30rem at 15% -10%, var(--t-glow), transparent 60%),
+    linear-gradient(var(--t-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--t-grid) 1px, transparent 1px);
+  background-size: auto, 32px 32px, 32px 32px;
+  color: var(--t-slate-200);
+  font-family: var(--t-font);
   font-feature-settings: "cv11", "ss01";
   -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease;
 }
 
 ::selection {
-  background: rgba(34, 211, 238, 0.3);
+  background: color-mix(in oklab, var(--t-accent), transparent 70%);
+}
+
+:focus-visible {
+  outline: 2px solid var(--t-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
 }
 
 /* Slim, quiet scrollbars for the panels. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.18) transparent;
+  scrollbar-color: color-mix(in oklab, var(--t-slate-400), transparent 80%) transparent;
+}
+
+/* Light themes: status hues use darker shades so text keeps contrast on pale surfaces. */
+:root[data-scheme="light"] {
+  --color-amber-200: #92400e;
+  --color-amber-300: #b45309;
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-rose-200: #9f1239;
+  --color-rose-300: #be123c;
+  --color-violet-200: #5b21b6;
+  --color-violet-300: #6d28d9;
+  --color-orange-300: #c2410c;
+  --color-red-300: #b91c1c;
 }
