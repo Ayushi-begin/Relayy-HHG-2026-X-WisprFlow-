@@ -265,13 +265,21 @@ async def _post_slack_review(ticket: Ticket, run_id: str, state: TicketState) ->
         if not slack.is_configured():
             return
         target = await slack.post_escalation(ticket.id, state, run_id, ticket.version)
+        refresh_needed = False
+        superseded = False
         with Session(engine) as session:
             run = session.get(TicketRun, run_id)
             current = session.get(Ticket, ticket.id)
-            if run and current and current.current_run_id == run_id and run.state == "reviewable":
+            if run and current:
                 run.slack_target = target
+                superseded = current.current_run_id != run_id
+                refresh_needed = superseded or run.state != "reviewable"
                 session.add(run)
                 session.commit()
+        # A web decision can arrive while Slack is still creating the message.
+        # Store the late target, then remove controls for the obsolete review.
+        if refresh_needed:
+            await slack.refresh_review(ticket.id, run_id, "This analysis run was superseded." if superseded else None)
     except Exception:
         # A Slack transport failure cannot invalidate the persisted web review.
         log.exception("Could not post Slack review for ticket %s", ticket.id)

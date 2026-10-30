@@ -120,6 +120,30 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(run.agent_state["events"][-1]["message"], "classified")
             self.assertEqual(ticket.swarm_state["events"][-1]["agent"], "triage")
 
+    def test_late_slack_target_survives_a_review_during_message_creation(self) -> None:
+        from integrations import slack
+        refreshed = []
+
+        async def post(*_):
+            with Session(self.engine) as session:
+                run = session.get(TicketRun, "run-1")
+                run.state = "authorized"
+                session.add(run)
+                session.commit()
+            return {"channel": "demo", "ts": "1"}
+
+        async def refresh(*args):
+            refreshed.append(args)
+
+        with Session(self.engine) as session:
+            ticket = session.get(Ticket, 1)
+            state = ticket_service.load_state(ticket)
+        with patch.object(slack, "is_configured", return_value=True), patch.object(slack, "post_escalation", post), patch.object(slack, "refresh_review", refresh):
+            asyncio.run(ticket_service._post_slack_review(ticket, "run-1", state))
+        with Session(self.engine) as session:
+            self.assertEqual(session.get(TicketRun, "run-1").slack_target, {"channel": "demo", "ts": "1"})
+        self.assertEqual(refreshed, [(1, "run-1", None)])
+
     def test_metrics_preserves_impact_schema_and_run_audit_costs(self) -> None:
         with Session(self.engine) as session:
             ticket = session.get(Ticket, 1)
