@@ -38,21 +38,9 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_FAST_MODEL
-        sync: false
+        value: gemini-2.5-flash
       - key: GEMINI_SMART_MODEL
-        sync: false
-      - key: ANTHROPIC_API_KEY
-        sync: false
-      - key: ANTHROPIC_FAST_MODEL
-        sync: false
-      - key: ANTHROPIC_SMART_MODEL
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_FAST_MODEL
-        sync: false
-      - key: OPENAI_SMART_MODEL
-        sync: false
+        value: gemini-2.5-flash
       # External effects stay off until test fixtures and recipients are verified.
       - key: DELIVERY_MODE
         value: disabled
