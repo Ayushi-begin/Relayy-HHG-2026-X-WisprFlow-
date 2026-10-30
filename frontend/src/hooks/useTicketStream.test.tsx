@@ -43,22 +43,29 @@ function StreamProbe() {
 }
 
 describe('useTicketStream', () => {
-  it('hydrates persisted snapshot events and safely reports malformed live data', async () => {
+  it('reconciles replayed non-agent envelopes without errors while retaining nested agent events', async () => {
     vi.stubGlobal('EventSource', MockEventSource)
-    vi.mocked(api.getTicket).mockResolvedValue(detail)
+    const completed: TicketDetail = { ...detail, status: 'resolved', version: 8 }
+    vi.mocked(api.getTicket).mockResolvedValue(completed)
     render(<StreamProbe />)
 
     await vi.waitFor(() => expect(screen.getByText('Triage complete:1:ok')).not.toBeNull())
+    for (const [kind, id] of [['status', '9'], ['review', '10'], ['authorization', '11']] as const) {
+      MockEventSource.latest!.emit('event', { ticket_id: 4, run_id: 'run-4', kind, timestamp: '2026-01-01T00:00:02Z', data: {} }, id)
+    }
+    await vi.waitFor(() => expect(api.getTicket).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Triage complete:1:ok')).not.toBeNull()
+
     MockEventSource.latest!.emit('event', {
       ticket_id: 4,
       run_id: 'run-4',
       kind: 'agent',
-      timestamp: '2026-01-01T00:00:02Z',
-      data: { agent: 'research', status: 'running', message: 'Research started', timestamp: '2026-01-01T00:00:02Z' },
-    }, '9')
+      timestamp: '2026-01-01T00:00:03Z',
+      data: { agent: 'research', status: 'running', message: 'Research started', timestamp: '2026-01-01T00:00:03Z' },
+    }, '12')
     await vi.waitFor(() => expect(screen.getByText('Triage complete:2:ok')).not.toBeNull())
 
-    MockEventSource.latest!.emit('event', { agent: 'triage' }, '10')
+    MockEventSource.latest!.emit('event', { ticket_id: 4, run_id: 'run-4', kind: 'agent', timestamp: '2026-01-01T00:00:04Z', data: {} }, '13')
     await vi.waitFor(() => expect(screen.getByText(/live update could not be read/)).not.toBeNull())
   })
 })

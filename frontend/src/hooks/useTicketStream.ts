@@ -12,10 +12,11 @@ export interface StreamedEvent extends SwarmEvent {
 interface TicketEventEnvelope {
   ticket_id: number
   run_id: string | null
-  kind: 'agent' | 'operation'
+  kind: string
   timestamp: string
   data: unknown
 }
+
 
 interface TicketStream {
   detail: TicketDetail | null
@@ -104,8 +105,9 @@ export function useTicketStream(ticketId: number): TicketStream {
           refetch()
           return
         }
-        // Operation records are authoritative in the next snapshot; they do not have swarm event fields.
-        if (envelope.kind === 'operation') {
+        // Durable non-agent records (and future event kinds) are represented only by the next snapshot.
+        if (envelope.kind !== 'agent') {
+          // Known status/review/authorization records and unknown future kinds reconcile safely.
           refetch()
           return
         }
