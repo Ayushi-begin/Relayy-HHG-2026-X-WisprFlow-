@@ -73,6 +73,9 @@ export interface Usage {
   cost_usd: number | null
 }
 
+export type StageName = 'triage' | 'research' | 'action'
+export type StageProvenance = 'real_model' | 'simulated' | 'failed'
+
 export interface TicketState {
   ticket: { id: number | null; customer_id: number | null; subject: string; body: string; created_at: string }
   triage: TriageResult | null
@@ -80,6 +83,8 @@ export interface TicketState {
   action: ActionResult | null
   events: SwarmEvent[]
   usage: Usage[]
+  provenance?: Partial<Record<StageName, StageProvenance>>
+  provenance_errors?: Partial<Record<StageName, string>>
 }
 
 export interface DeliveryOperation {
@@ -173,7 +178,7 @@ export interface Metrics {
   agent_hours_saved: number
   total_cost_usd: number | null
   cost_per_ticket_usd: number | null
-  cost_by_agent: Partial<Record<AgentName, number>>
+  cost_by_agent: Partial<Record<AgentName, number | null>>
   escalations_by_rule: Record<string, number>
   human_reviews: { approved: number; edited: number; rejected: number }
   ai_reply_acceptance_rate: number | null

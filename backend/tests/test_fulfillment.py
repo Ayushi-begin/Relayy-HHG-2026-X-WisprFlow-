@@ -311,3 +311,130 @@ async def test_frozen_request_mutation_blocks_send(database):
     assert not provider.sends
     with Session(database) as session:
         assert session.get(DeliveryOperation, identifier).error_code == "request_changed"
+
+
+@pytest.mark.asyncio
+async def test_transient_recheck_preserves_confirmed_refund_and_email_recovery(database):
+    with Session(database) as session:
+        refund = refund_fixture(session)
+        reply = email(session, dependency_id=refund.id)
+        session.commit()
+        refund_id, email_id = refund.id, reply.id
+    stripe = FakeStripe()
+    await service.process_operation(refund_id, refund_provider=stripe)
+    with Session(database) as session:
+        op = session.get(DeliveryOperation, refund_id)
+        op.next_check_at = store.now()
+        session.add(op)
+        session.commit()
+    stripe.result = ProviderResult("unknown", "http_503", error_code="provider_unavailable")
+    await service.process_operation(refund_id, refund_provider=stripe)
+    with Session(database) as session:
+        op = session.get(DeliveryOperation, refund_id)
+        assert op.state == "succeeded" and op.provider_id == "re_demo"
+        assert op.send_attempt_count == 1
+    resend = FakeEmail()
+    await service.process_operation(email_id, email_provider=resend)
+    assert len(resend.sends) == 1 and len(stripe.refunds) == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_delivery_does_not_revoke_recorded_refund(database, monkeypatch):
+    with Session(database) as session:
+        op = refund_fixture(session)
+        op.state, op.provider_id, op.provider_status = "succeeded", "re_demo", "succeeded"
+        session.add(op)
+        session.commit()
+        identifier = op.id
+    monkeypatch.setattr(config, "DELIVERY_MODE", "disabled")
+    stripe = FakeStripe()
+    await service.process_operation(identifier, refund_provider=stripe)
+    assert not stripe.refunds
+    with Session(database) as session:
+        assert session.get(DeliveryOperation, identifier).state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_manual_read_still_works_after_scheduled_check_budget(database):
+    with Session(database) as session:
+        op = refund_fixture(session)
+        op.state, op.provider_id = "pending", "re_demo"
+        op.attempt_count, op.check_attempt_count, op.send_attempt_count = 25, 24, 1
+        session.add(op)
+        session.commit()
+        identifier = op.id
+    service.request_recovery(1, identifier, 0, "reconcile")
+    stripe = FakeStripe()
+    await service.process_operation(identifier, refund_provider=stripe)
+    with Session(database) as session:
+        op = session.get(DeliveryOperation, identifier)
+        assert op.state == "succeeded"
+        assert op.send_attempt_count == 1
+        assert op.check_attempt_count == 25
+        assert not op.manual_check_requested
+    assert not stripe.refunds
+
+
+@pytest.mark.asyncio
+async def test_owned_provider_refund_is_adopted_in_send_path(database):
+    with Session(database) as session:
+        op = refund_fixture(session)
+        session.commit()
+        identifier = op.id
+    stripe = FakeStripe()
+    stripe.refunded = 3000
+
+    async def refunds(_):
+        return [{"id": "re_demo", "charge_id": "ch_demo", "amount": 3000, "currency": "usd", "metadata": {"relayy_operation_id": identifier}}]
+
+    stripe.list_refunds = refunds
+    await service.process_operation(identifier, refund_provider=stripe)
+    assert not stripe.refunds
+    with Session(database) as session:
+        assert session.get(DeliveryOperation, identifier).state == "succeeded"
+        assert session.get(DeliveryOperation, identifier).send_attempt_count == 0
+
+
+def test_blocked_dependency_cannot_offer_or_claim_email_retry(database):
+    with Session(database) as session:
+        refund = refund_fixture(session)
+        refund.state = "blocked"
+        reply = email(session, dependency_id=refund.id)
+        reply.state, reply.error_code = "blocked", "missing_eligibility_evidence"
+        session.add(refund)
+        session.add(reply)
+        session.commit()
+        identifier = reply.id
+        assert service.serialize_operation(reply, session)["allowed_actions"] == []
+    with pytest.raises(ValueError, match="unavailable"):
+        service.request_recovery(1, identifier, 0, "retry")
+
+
+def test_disabled_frozen_email_does_not_offer_impossible_retry(database, monkeypatch):
+    monkeypatch.setattr(config, "DELIVERY_MODE", "disabled")
+    with Session(database) as session:
+        op = email(session, blocked="delivery_disabled")
+        assert service.serialize_operation(op, session)["allowed_actions"] == []
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_blocked_dependencies_instead_of_starving_ready_work(database, monkeypatch):
+    import asyncio
+    with Session(database) as session:
+        refund = refund_fixture(session)
+        refund.state = "blocked"
+        session.add(refund)
+        for index in range(12):
+            store.freeze(session, ticket_id=1, run_id="run1", kind="email", request={}, logical_key=f"waiting:{index}", dependency_id=refund.id)
+        ready = store.freeze(session, ticket_id=1, run_id="run1", kind="email", request={}, logical_key="ready")
+        session.commit()
+        ready_id = ready.id
+    stop, seen = asyncio.Event(), []
+
+    async def execute(identifier):
+        seen.append(identifier)
+        stop.set()
+
+    monkeypatch.setattr(service, "process_operation", execute)
+    await asyncio.wait_for(service.worker(stop), timeout=2)
+    assert seen == [ready_id]

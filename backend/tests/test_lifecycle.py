@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ticket_service
 from events import EventBus
-from models import Customer, DeliveryOperation, Ticket, TicketRun, TicketStatus, Tier
-from swarm.state import ActionProposal, ActionResult, Event, TicketData, TicketState, Usage
+from models import Customer, DeliveryOperation, Payment, PaymentStatus, Ticket, TicketRun, TicketStatus, Tier
+from swarm.state import ActionProposal, ActionResult, Event, PaymentRecord, ResearchResult, TicketData, TicketState, Usage
 
 
 class LifecycleTests(unittest.TestCase):
@@ -139,6 +139,7 @@ class LifecycleTests(unittest.TestCase):
                                    agent_state=historic_state.model_dump(mode="json"), started_at=dt.datetime.now(dt.timezone.utc))
             current.agent_state = current_state.model_dump(mode="json")
             current.review_outcome = "approved"
+            current.state = "processing"
             ticket.swarm_state = current.agent_state
             ticket.resolution = None
             session.add(historical)
@@ -169,6 +170,57 @@ class LifecycleTests(unittest.TestCase):
             summary = ticket_service.run_summaries(session, 2)
         self.assertEqual(summary[0]["state"], "legacy_local_only")
         self.assertEqual(summary[0]["agent_state"]["ticket"]["id"], 2)
+
+    def test_reserved_auto_refund_becomes_manual_only_not_reviewable(self) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        with Session(self.engine) as session:
+            first_ticket = session.get(Ticket, 1)
+            first_run = session.get(TicketRun, "run-1")
+            first_ticket.status = TicketStatus.processing
+            first_run.state = "processing"
+            second_ticket = Ticket(id=2, customer_id=1, subject="Second refund", body="same charge", created_at=now,
+                                   status=TicketStatus.processing, current_run_id="run-2", version=1)
+            second_run = TicketRun(id="run-2", ticket_id=2, run_number=1, state="processing",
+                                   input_snapshot={"subject": "Second refund"}, started_at=now)
+            payment = Payment(id=1, customer_id=1, amount=30.0, date=now, status=PaymentStatus.succeeded,
+                              description="shared", stripe_charge_id="ch_shared", amount_minor=3000, currency="usd", livemode=False)
+            session.add(first_ticket)
+            session.add(first_run)
+            session.add(second_ticket)
+            session.add(second_run)
+            session.add(payment)
+            session.commit()
+
+        def automatic_state(ticket_id: int, subject: str) -> TicketState:
+            return TicketState(
+                ticket=TicketData(id=ticket_id, customer_id=1, subject=subject, body="refund"),
+                research=ResearchResult(payments=[PaymentRecord(id=1, customer_id=1, amount=30.0, date=now,
+                    status="succeeded", description="shared", stripe_charge_id="ch_shared", amount_minor=3000,
+                    currency="usd", livemode=False)]),
+                action=ActionResult(decision="auto_refund", reply_draft="Refund confirmed", reasoning="eligible",
+                                    confidence=0.9, payment_id=1, refund_amount_minor=3000),
+            )
+
+        async def no_op_pipeline(state: TicketState):
+            if False:
+                yield Event(agent="action", status="done", message="unreachable")
+
+        with patch.object(ticket_service, "run_pipeline", no_op_pipeline):
+            asyncio.run(ticket_service._process(1, "run-1", automatic_state(1, "Need help")))
+            asyncio.run(ticket_service._process(2, "run-2", automatic_state(2, "Second refund")))
+
+        with Session(self.engine) as session:
+            second = session.get(Ticket, 2)
+            second_run = session.get(TicketRun, "run-2")
+            second_ops = session.exec(select(DeliveryOperation).where(DeliveryOperation.ticket_id == 2)).all()
+            self.assertEqual(second_run.state, "authorization_failed")
+            self.assertEqual(second.fulfillment_state, "blocked")
+            self.assertTrue(second.manual_followup_required)
+            self.assertEqual(second.resolution, "refund_target_reserved")
+            self.assertEqual(second_ops, [])
+            _, _, applied = ticket_service.apply_human_action(2, "approved", "operator", run_id="run-2",
+                                                               expected_version=second.version)
+            self.assertFalse(applied)
 
     def test_event_bus_invalidates_overflow_without_unbounded_queue(self) -> None:
         async def exercise() -> None:

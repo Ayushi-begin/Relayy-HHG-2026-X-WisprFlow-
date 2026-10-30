@@ -3,9 +3,10 @@
 import asyncio
 import datetime as dt
 import json
+import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ from swarm.state import TicketState, utcnow
 
 router = APIRouter()
 HEARTBEAT_SECONDS = 15
+log = logging.getLogger(__name__)
 
 
 class TicketCreate(BaseModel):
@@ -110,6 +112,14 @@ def _accepted(ticket_id: int) -> TicketAccepted:
     return TicketAccepted(id=ticket_id, status="processing", stream_url=f"/tickets/{ticket_id}/stream")
 
 
+async def _refresh_slack_review(ticket_id: int, run_id: str, resolution: str | None = None) -> None:
+    try:
+        from integrations import slack
+        await slack.refresh_review(ticket_id, run_id, resolution)
+    except Exception:
+        log.exception("Could not refresh stored Slack review for ticket %s", ticket_id)
+
+
 @router.post("/tickets", status_code=status.HTTP_202_ACCEPTED)
 async def create_ticket(payload: TicketCreate, _: str = Depends(require_operator)) -> TicketAccepted:
     """Create a validated intake and immediately start its first persisted run."""
@@ -140,16 +150,21 @@ async def create_ticket(payload: TicketCreate, _: str = Depends(require_operator
 
 
 @router.post("/tickets/{ticket_id}/process", status_code=status.HTTP_202_ACCEPTED)
-async def process_ticket(ticket_id: int, _: str = Depends(require_operator)) -> TicketAccepted:
+async def process_ticket(ticket_id: int, background: BackgroundTasks, _: str = Depends(require_operator)) -> TicketAccepted:
     with Session(engine) as session:
-        _get_ticket(session, ticket_id)
+        ticket = _get_ticket(session, ticket_id)
+        prior_run_id = ticket.current_run_id
     if not ticket_service.start_processing(ticket_id):
         raise HTTPException(status.HTTP_409_CONFLICT, "Ticket has active processing, review, or a delivery operation")
+    if prior_run_id:
+        background.add_task(_refresh_slack_review, ticket_id, prior_run_id,
+                            "Review superseded by a rerun; review actions are unavailable.")
     return _accepted(ticket_id)
 
 
 @router.post("/tickets/{ticket_id}/review", response_model=TicketDetail, status_code=status.HTTP_202_ACCEPTED)
-def review_ticket(ticket_id: int, payload: HumanReviewRequest, actor: str = Depends(require_operator)) -> TicketDetail:
+def review_ticket(ticket_id: int, payload: HumanReviewRequest, background: BackgroundTasks,
+                  actor: str = Depends(require_operator)) -> TicketDetail:
     if payload.action == "edited" and not (payload.reply or "").strip():
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Edited replies cannot be blank")
     try:
@@ -163,6 +178,7 @@ def review_ticket(ticket_id: int, payload: HumanReviewRequest, actor: str = Depe
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
     if not applied:
         raise HTTPException(status.HTTP_409_CONFLICT, "Review is stale or was already handled; refresh the ticket.")
+    background.add_task(_refresh_slack_review, ticket_id, payload.run_id)
     with Session(engine) as session:
         return _detail(session, _get_ticket(session, ticket_id))
 

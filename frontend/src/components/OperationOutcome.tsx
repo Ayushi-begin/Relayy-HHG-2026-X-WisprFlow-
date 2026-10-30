@@ -14,7 +14,7 @@ export function OperationOutcome({ detail, token, onDetail }: Props) {
   const [busyOperation, setBusyOperation] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const operations = detail.operations ?? []
-  if (!operations.length && !detail.fulfillment_state) return null
+  if (!operations.length && (!detail.fulfillment_state || detail.fulfillment_state === 'not_requested')) return null
 
   const refund = operations.find((operation) => operation.kind === 'refund')
   const email = operations.find((operation) => operation.kind === 'email')
@@ -24,14 +24,18 @@ export function OperationOutcome({ detail, token, onDetail }: Props) {
   const failed = operations.some((operation) => operation.state === 'failed' || operation.state === 'blocked')
   const tone = completed ? 'emerald' : unknownRefund ? 'amber' : failed || partial ? 'rose' : 'cyan'
   const title = completed
-    ? 'Email accepted · test refund succeeded'
+    ? refund
+      ? 'Email accepted · test refund succeeded'
+      : 'Email accepted by provider'
     : unknownRefund
       ? 'Refund outcome unknown'
       : partial
         ? 'Refund complete · email needs attention'
         : 'Delivery status'
   const intro = completed
-    ? 'Provider operations completed. Inbox delivery is not confirmed.'
+    ? detail.manual_followup_required
+      ? 'Reply accepted; original issue still needs review.'
+      : 'Provider operations completed. Inbox delivery is not confirmed.'
     : unknownRefund
       ? 'Check Stripe before taking another action. Re-run and completion stay blocked.'
       : partial

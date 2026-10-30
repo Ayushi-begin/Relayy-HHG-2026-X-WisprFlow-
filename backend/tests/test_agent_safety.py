@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+from types import SimpleNamespace
 
 from swarm import llm, tools
 from swarm.action import _brief as action_brief
@@ -74,3 +75,36 @@ def test_unknown_model_pricing_is_unavailable():
     usage = []
     llm.record_usage(usage, "triage", "unverified-model", Response())
     assert usage[0].cost_usd is None
+
+
+def test_model_exception_provenance_omits_provider_body_and_credentials():
+    error = RuntimeError("provider body: api_key=sk-secret-value card 4111 1111 1111 1111")
+    safe = llm.sanitized_error(error)
+    assert safe == "Model provider request failed (RuntimeError)"
+    assert "sk-secret" not in safe
+    assert "4111" not in safe
+
+
+def test_research_tool_budget_exhaustion_is_failed_not_real_model(monkeypatch):
+    import swarm.research as research_module
+
+    class FakeMessages:
+        async def create(self, **_kwargs):
+            return SimpleNamespace(
+                usage=None,
+                stop_reason="tool_use",
+                content=[SimpleNamespace(type="tool_use", name="unknown", input={}, id="tool-call")],
+            )
+
+    fake_client = SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages()))
+    monkeypatch.setattr(research_module.config, "ANTHROPIC_API_KEY", "configured-for-test")
+    monkeypatch.setattr(research_module, "MODEL", "configured-model")
+    monkeypatch.setattr(research_module.llm, "client", lambda: fake_client)
+    monkeypatch.setattr(research_module.tools, "lookup_customer", lambda _ctx, _customer_id: None)
+
+    state = TicketState(ticket=ticket("Please investigate my billing issue"))
+    result = asyncio.run(research_module.research(state, lambda _status, _message: None))
+
+    assert result.key_findings == ["No findings: research did not complete."]
+    assert state.provenance["research"] == "failed"
+    assert state.provenance_errors["research"] == "research tool budget exhausted without final findings"

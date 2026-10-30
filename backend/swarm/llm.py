@@ -61,8 +61,15 @@ def sanitize_model_value(value: Any) -> Any:
 
 
 def sanitized_error(error: Exception | str) -> str:
-    """Keep a bounded, selected-pattern-redacted diagnostic for local provenance."""
-    return sanitize_model_value(f"{type(error).__name__}: {error}" if isinstance(error, Exception) else error)[:500]
+    """Return a safe provenance diagnostic without retaining provider error bodies.
+
+    Exception messages can contain credentials, request fragments, or provider echoes. Preserve
+    only the bounded exception class and a generic model-provider failure message; callers pass
+    string reasons only when they are fixed local classifications.
+    """
+    if isinstance(error, Exception):
+        return f"Model provider request failed ({type(error).__name__})"
+    return sanitize_model_value(error)[:500]
 
 
 def record_provenance(

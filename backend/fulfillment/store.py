@@ -52,7 +52,9 @@ def claim(session: Session, operation: DeliveryOperation, kind: str) -> tuple[st
         DeliveryOperation.state == operation.state,
     ).values(state="executing", claim_token=token, claim_expires_at=timestamp + dt.timedelta(seconds=90),
              first_attempt_at=first, retry_deadline=operation.retry_deadline or aware(first) + dt.timedelta(hours=23),
-             attempt_count=operation.attempt_count + 1, version=operation.version + 1, updated_at=timestamp))
+             attempt_count=operation.attempt_count + 1,
+             check_attempt_count=operation.check_attempt_count + (1 if kind == "reconcile" else 0),
+             manual_check_requested=False, version=operation.version + 1, updated_at=timestamp))
     if result.rowcount != 1:
         return None
     attempt = OperationAttempt(operation_id=operation.id, attempt_number=operation.attempt_count,

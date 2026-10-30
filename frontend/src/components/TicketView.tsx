@@ -4,7 +4,8 @@ import { api } from '../api'
 import type { ActionResult, ResearchResult, TicketDetail, TriageResult } from '../api'
 import { useTicketStream } from '../hooks/useTicketStream'
 import type { StreamedEvent } from '../hooks/useTicketStream'
-import { decisionMeta, money, ruleLabels, statusMeta, tierTone, timeAgo, toneClasses, urgencyMeta } from '../lib/format'
+import { decisionMeta, money, recordedModel, ruleLabels, statusMeta, tierTone, timeAgo, toneClasses, urgencyMeta } from '../lib/format'
+import { outcomeBanner } from '../lib/outcome'
 import { phaseOf } from '../lib/phase'
 import type { FlowState } from '../lib/phase'
 import { AgentCard, FlowConnector } from './AgentCard'
@@ -62,17 +63,41 @@ function TicketStreamView({ ticketId, operatorToken }: { ticketId: number; opera
       <TicketHeader detail={detail} status={currentStatus} connected={connected} operatorToken={operatorToken} onDetail={replaceDetail} />
 
       <FlowConnector state={phases[0] === 'idle' ? (currentStatus === 'processing' ? 'flowing' : 'idle') : 'done'} />
-      <AgentCard emoji="🧭" title="Triage" model="haiku-5.5" role="Classifies category, urgency, sentiment and manipulation risk" events={triageEvents}>
+      <AgentCard
+        emoji="🧭"
+        title="Triage"
+        model={recordedModel(detail.state.usage, 'triage')}
+        provenance={detail.state.provenance?.triage ?? 'unknown'}
+        provenanceError={detail.state.provenance_errors?.triage}
+        role="Classifies category, urgency, sentiment and manipulation risk"
+        events={triageEvents}
+      >
         {triage && <TriageResults triage={triage} />}
       </AgentCard>
 
       <FlowConnector state={flow(1)} />
-      <AgentCard emoji="🔎" title="Research" model="sonnet-5.5" role="Checks customer records, payments, history and help docs" events={researchEvents}>
+      <AgentCard
+        emoji="🔎"
+        title="Research"
+        model={recordedModel(detail.state.usage, 'research')}
+        provenance={detail.state.provenance?.research ?? 'unknown'}
+        provenanceError={detail.state.provenance_errors?.research}
+        role="Checks customer records, payments, history and help docs"
+        events={researchEvents}
+      >
         {research && <ResearchResults research={research} />}
       </AgentCard>
 
       <FlowConnector state={flow(2)} />
-      <AgentCard emoji="⚡" title="Action" model="sonnet-5.5 + policy" role="Proposes a resolution; Python guardrails have the final say" events={actionEvents}>
+      <AgentCard
+        emoji="⚡"
+        title="Action"
+        model={recordedModel(detail.state.usage, 'action')}
+        provenance={detail.state.provenance?.action ?? 'unknown'}
+        provenanceError={detail.state.provenance_errors?.action}
+        role="Proposes a resolution; Python guardrails have the final say"
+        events={actionEvents}
+      >
         {action && <ActionResults action={action} />}
       </AgentCard>
 
@@ -125,6 +150,7 @@ function TicketHeader({
             <span>{timeAgo(t.created_at)}</span>
             <span>·</span>
             <LiveDot on={connected} label={connected ? 'Streaming' : 'Reconnecting'} />
+            {detail.execution_mode && <><span>·</span><span>Execution: {detail.execution_mode}</span></>}
           </div>
           <h1 className="mt-1 text-lg font-semibold tracking-tight text-white">{t.subject}</h1>
           <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-slate-400">
@@ -430,23 +456,7 @@ function Outcome({
   const tokens = detail.state.usage.reduce((n, u) => n + u.input_tokens + u.output_tokens, 0)
   const cost = detail.state.usage.reduce((n, u) => n + (u.cost_usd ?? 0), 0)
   const edited = detail.resolution === 'edited'
-
-  const banner = (() => {
-    switch (status) {
-      case 'processing':
-        return { tone: 'cyan' as const, icon: <Spinner className="size-4" />, title: 'Agents are working', body: 'Results appear as each agent finishes.' }
-      case 'escalated':
-        return { tone: 'amber' as const, icon: '⚑', title: 'Awaiting human review', body: 'Review and act below in Mission Control or via Slack notification.' }
-      case 'resolved':
-        return detail.resolved_by === 'ai'
-          ? { tone: 'emerald' as const, icon: '✓', title: 'Authorization complete', body: 'Provider outcome is shown separately below.' }
-          : { tone: 'violet' as const, icon: '✓', title: `${edited ? 'Edited and approved' : 'Approved'} by @${detail.resolved_by}`, body: 'Approval is not proof of email delivery.' }
-      case 'rejected':
-        return { tone: 'rose' as const, icon: '✕', title: `Rejected by @${detail.resolved_by}`, body: 'This ticket needs manual handling.' }
-      default:
-        return { tone: 'slate' as const, icon: '•', title: 'Not processed yet', body: 'Run the agents to triage, research and resolve this ticket.' }
-    }
-  })()
+  const banner = outcomeBanner(detail, status)
 
   return (
     <motion.div layout="position" className={`rounded-2xl p-4 ring-1 ring-inset ${toneClasses[banner.tone]}`}>
@@ -456,7 +466,7 @@ function Outcome({
           animate={status === 'escalated' ? { scale: [1, 1.08, 1] } : { scale: 1 }}
           transition={{ duration: 1.8, repeat: status === 'escalated' ? Infinity : 0 }}
         >
-          {banner.icon}
+          {banner.icon === 'loading' ? <Spinner className="size-4" /> : banner.icon}
         </motion.div>
         <div className="min-w-0 flex-1">
           <p className="text-sm font-semibold">{banner.title}</p>

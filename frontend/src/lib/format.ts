@@ -1,4 +1,4 @@
-import type { Decision, DeliveryOperation, TicketStatus, Urgency } from '../api'
+import type { AgentName, Decision, DeliveryOperation, TicketState, TicketStatus, Urgency } from '../api'
 
 export type Tone = 'slate' | 'cyan' | 'amber' | 'emerald' | 'violet' | 'rose' | 'orange' | 'red'
 
@@ -63,6 +63,10 @@ export const tierTone: Record<string, Tone> = { vip: 'violet', pro: 'cyan', free
 
 export function money(n: number, digits = 2): string {
   return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+export function recordedModel(usage: TicketState['usage'], agent: AgentName): string {
+  return usage.find((entry) => entry.agent === agent)?.model ?? 'No verified model'
 }
 
 export function timeAgo(iso: string, now = Date.now()): string {

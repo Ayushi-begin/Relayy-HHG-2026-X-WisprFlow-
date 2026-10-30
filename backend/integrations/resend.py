@@ -143,5 +143,11 @@ class ResendAdapter:
         returned_id = data.get("id") if isinstance(data, dict) else None
         if returned_id != provider_id:
             return ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Provider response did not verify the requested email")
-        status = data.get("last_event") if isinstance(data.get("last_event"), str) else "retrieved"
+        status = data.get("last_event") if isinstance(data.get("last_event"), str) and data["last_event"].strip() else None
+        if status is None:
+            return ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Provider response omitted the email event status")
+        normalized_status = status.lower()
+        if "failed" in normalized_status or "bounced" in normalized_status:
+            return ProviderResult("failed", status, provider_id=provider_id, request_id=_safe_request_id(response.headers), error_code="email_failed", error_message="Resend reported that the email did not complete")
+        # Retain Resend's actual event without translating it to inbox delivery.
         return ProviderResult("accepted", status, provider_id=provider_id, request_id=_safe_request_id(response.headers))

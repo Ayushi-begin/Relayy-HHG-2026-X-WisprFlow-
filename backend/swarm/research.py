@@ -193,6 +193,13 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
                 break
             if iteration == MAX_ITERATIONS:
                 emit("tool", f"⏱️ Tool budget of {MAX_ITERATIONS} rounds used up; finishing with what was found.")
+                llm.record_provenance(
+                    state.provenance,
+                    state.provenance_errors,
+                    "research",
+                    "failed",
+                    "research tool budget exhausted without final findings",
+                )
                 break
 
             results = []
@@ -218,7 +225,15 @@ async def research(state: TicketState, emit: Emit) -> ResearchResult:
         except tools.ToolError:
             pass
 
-    if state.provenance.get("research") is None:
+    if not findings and state.provenance.get("research") is None:
+        llm.record_provenance(
+            state.provenance,
+            state.provenance_errors,
+            "research",
+            "failed",
+            "research completed without valid final findings",
+        )
+    elif state.provenance.get("research") is None:
         llm.record_provenance(state.provenance, state.provenance_errors, "research", "real_model")
     return ResearchResult(
         customer=ctx.customer,

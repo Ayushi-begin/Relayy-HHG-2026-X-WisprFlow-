@@ -199,3 +199,35 @@ async def refresh_delivery(ticket_id: int, target: dict[str, str]) -> None:
     authorized_reply = (run.authorized_plan or {}).get("reply")
     await update_message(ticket_id, state, run.id, ticket.version, f"{outcome}.", sent_reply=authorized_reply,
                          channel=target.get("channel"), ts=target.get("ts"))
+
+
+async def refresh_review(ticket_id: int, run_id: str, resolution: str | None = None) -> None:
+    """Refresh the persisted Slack target after a committed review or rerun."""
+    from sqlmodel import Session
+
+    from db import engine
+    from models import Ticket, TicketRun
+    import ticket_service
+
+    with Session(engine) as session:
+        ticket = session.get(Ticket, ticket_id)
+        run = session.get(TicketRun, run_id)
+        if not ticket or not run or not run.slack_target:
+            return
+        state = ticket_service._ticket_state(ticket, run)
+        reply = ticket.final_reply or (run.authorized_plan or {}).get("reply")
+        if resolution is None:
+            if ticket.fulfillment_state == "blocked":
+                resolution = "Authorization blocked; manual follow-up is required."
+            elif ticket.fulfillment_state == "partial":
+                resolution = "Delivery is partially complete; manual follow-up is required."
+            elif ticket.fulfillment_state == "pending":
+                resolution = "Authorization accepted; provider outcome is pending."
+            elif ticket.resolution == "rejected":
+                resolution = "Rejected; manual handling is required."
+            else:
+                resolution = f"Ticket is {ticket.status}."
+        target = run.slack_target
+        version = ticket.version
+    await update_message(ticket_id, state, run_id, version, resolution, sent_reply=reply,
+                         channel=target.get("channel"), ts=target.get("ts"))

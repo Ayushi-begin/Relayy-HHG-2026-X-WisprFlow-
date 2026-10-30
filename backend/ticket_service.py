@@ -167,7 +167,7 @@ def _finalize_run(ticket_id: int, run_id: str, state: TicketState, *, status: Ti
     with Session(engine) as session:
         ticket = session.get(Ticket, ticket_id)
         run = session.get(TicketRun, run_id)
-        if not ticket or not run or ticket.current_run_id != run_id:
+        if not ticket or not run or ticket.current_run_id != run_id or run.state != "processing":
             return None
         run.agent_state = state.model_dump(mode="json")
         run.execution_mode = _execution_mode(state)
@@ -193,6 +193,7 @@ def _finalize_run(ticket_id: int, run_id: str, state: TicketState, *, status: Ti
 
 
 async def _process(ticket_id: int, run_id: str, state: TicketState) -> None:
+    authorization_started = False
     try:
         async for event in run_pipeline(state):
             _record_agent_event(ticket_id, run_id, state, event)
@@ -200,6 +201,7 @@ async def _process(ticket_id: int, run_id: str, state: TicketState) -> None:
         if action and action.decision in ("auto_resolve", "auto_refund"):
             # Fulfillment authorizes only policy/provenance-valid actions. It may create
             # blocked records, which is still a durable, truthful terminal analysis result.
+            authorization_started = True
             _authorize_automatic(ticket_id, run_id, state)
         else:
             ticket = _finalize_run(ticket_id, run_id, state, status=TicketStatus.escalated, run_state="reviewable")
@@ -210,9 +212,50 @@ async def _process(ticket_id: int, run_id: str, state: TicketState) -> None:
         event = Event(agent="orchestrator", status="error", message=f"Processing failed: {type(exc).__name__}")
         state.events.append(event)
         _record_agent_event(ticket_id, run_id, state, event)
-        _finalize_run(ticket_id, run_id, state, status=TicketStatus.escalated, run_state="reviewable")
+        if authorization_started:
+            _mark_authorization_failed(ticket_id, run_id, state, exc)
+        else:
+            _finalize_run(ticket_id, run_id, state, status=TicketStatus.escalated, run_state="reviewable")
     finally:
         _live.pop(ticket_id, None)
+
+
+def _mark_authorization_failed(ticket_id: int, run_id: str, state: TicketState, error: Exception) -> None:
+    """Freeze failed automatic authorization as manual-only, never as a fresh review.
+
+    A reservation conflict may mean another ticket already owns a provider target. The
+    original auto-refund confirmation is therefore unsafe to display as approvable.
+    """
+    reason = "refund_target_reserved" if "different frozen operation" in str(error).lower() else "authorization_failed"
+    with Session(engine) as session:
+        ticket = session.get(Ticket, ticket_id)
+        run = session.get(TicketRun, run_id)
+        if not ticket or not run or ticket.current_run_id != run_id or run.state != "processing":
+            return
+        snapshot = state.model_dump(mode="json")
+        run.agent_state = snapshot
+        run.execution_mode = _execution_mode(state)
+        run.state = "authorization_failed"
+        run.ended_at = utcnow()
+        run.authorized_plan = {"source": "ai", "authorization_error": reason}
+        ticket.swarm_state = snapshot
+        ticket.status = TicketStatus.escalated
+        ticket.resolution = reason
+        ticket.final_reply = None
+        ticket.fulfillment_state = "blocked"
+        ticket.manual_followup_required = True
+        ticket.updated_at = utcnow()
+        ticket.version += 1
+        durable = _append_event(session, ticket, run_id, "authorization_failed", {
+            "reason": reason, "status": "escalated", "version": ticket.version,
+        })
+        payload = _event_payload(durable)
+        session.add(run)
+        session.add(ticket)
+        session.commit()
+        session.refresh(ticket)
+    _publish(payload)
+    bus.publish_status(ticket_id, _status(ticket.status), ticket.resolution, run_id=run_id, version=ticket.version)
 
 
 async def _post_slack_review(ticket: Ticket, run_id: str, state: TicketState) -> None:
@@ -345,9 +388,9 @@ def request_recovery(ticket_id: int, operation_id: str, expected_version: int, a
     _request_recovery(ticket_id, operation_id, expected_version, action)
 
 
-def operation_projection(operation: DeliveryOperation) -> dict[str, Any]:
+def operation_projection(operation: DeliveryOperation, session: Session) -> dict[str, Any]:
     from fulfillment.service import serialize_operation
-    return serialize_operation(operation)
+    return serialize_operation(operation, session)
 
 
 def serialize_ticket(session: Session, ticket: Ticket) -> dict[str, Any]:
@@ -364,7 +407,7 @@ def serialize_ticket(session: Session, ticket: Ticket) -> dict[str, Any]:
         "execution_mode": run.execution_mode if run else "legacy", "fulfillment_state": ticket.fulfillment_state,
         "manual_followup_required": ticket.manual_followup_required, "can_review": can_review,
         "can_reprocess": not is_running(ticket.id) and not operations and _status(ticket.status) != "processing",
-        "operations": [operation_projection(op) for op in operations], "legacy_local_only": ticket.legacy_local_only,
+        "operations": [operation_projection(op, session) for op in operations], "legacy_local_only": ticket.legacy_local_only,
     }
 
 

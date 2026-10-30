@@ -119,7 +119,7 @@ Use only server-authorized Retry or Reconcile controls. Recovery keeps the origi
 
 A timeout may follow a successful provider action. Reconcile before any new attempt. Unknown email requests without a provider ID stop automatic resends after a conservative 23-hour window. Provider key retention is finite, so the system does not promise exactly-once effects.
 
-Startup preserves accepted/succeeded operations and marks interrupted sends unknown. A bounded worker resumes queued operations and checks pending/unknown results. Each operation has a finite attempt budget. Manual investigation remains necessary when evidence is ambiguous or the attempt budget expires.
+Startup preserves accepted/succeeded operations and marks interrupted sends unknown. A bounded worker resumes queued operations and checks pending/unknown results. The runtime separates a six-submission budget from twelve scheduled read checks. A transient read failure does not erase a confirmed refund. An operator can request a read-only reconciliation after scheduled checks stop. Manual investigation remains necessary when evidence is ambiguous or the send budget expires.
 
 Analysis reruns stop after any delivery operation exists. Earlier runs and monotonic persisted events remain available through `GET /tickets/{id}/runs`. A browser reconnect retrieves authoritative state rather than assuming all SSE messages arrived.
 

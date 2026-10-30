@@ -43,8 +43,12 @@ def _value(raw: str) -> dict[str, Any] | None:
 def _note(ticket: Ticket) -> str:
     if ticket.resolution == "rejected":
         return "Rejected; manual handling is required."
-    if ticket.resolution in {"approved", "edited"}:
-        return "Authorization queued; provider outcome will be posted when known."
+    if ticket.fulfillment_state == "blocked":
+        return "Authorization blocked; manual follow-up is required."
+    if ticket.fulfillment_state == "partial":
+        return "Delivery is partially complete; manual follow-up is required."
+    if ticket.fulfillment_state == "pending":
+        return "Authorization accepted; provider outcome is pending."
     return f"Ticket is {ticket.status}."
 
 
@@ -59,8 +63,10 @@ async def _ephemeral(response_url: str, text: str) -> None:
 
 async def _refresh_message(ticket: Ticket, state, run: TicketRun, target: dict[str, str]) -> None:
     try:
+        stored_target = run.slack_target or target
+        reply = ticket.final_reply or (run.authorized_plan or {}).get("reply")
         await slack.update_message(ticket.id, state, run.id, ticket.version, _note(ticket),
-                                   sent_reply=ticket.final_reply, channel=target.get("channel"), ts=target.get("ts"))
+                                   sent_reply=reply, channel=stored_target.get("channel"), ts=stored_target.get("ts"))
     except (slack.SlackError, OSError):
         # The DB action succeeded; never retry delivery based on a display refresh failure.
         log.exception("Could not refresh Slack ticket %s", ticket.id)

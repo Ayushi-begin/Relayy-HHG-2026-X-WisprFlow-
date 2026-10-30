@@ -19,6 +19,7 @@ from fulfillment import store
 
 log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 6
+MAX_SCHEDULED_CHECKS = 12
 
 
 def readiness() -> dict:
@@ -56,6 +57,8 @@ def _email_block(request: dict, session: Session | None = None) -> str | None:
 def _refund_block(session: Session, ticket: Ticket, request: dict) -> str | None:
     if config.DELIVERY_MODE != "test":
         return "delivery_disabled"
+    if len(config.DEMO_OPERATOR_TOKEN) < 32:
+        return "operator_not_configured"
     if not config.STRIPE_SECRET_KEY.startswith(("sk_test_", "rk_test_")) or not config.STRIPE_ACCOUNT_ID:
         return "stripe_test_not_configured"
     payment = session.get(Payment, request.get("local_payment_id"))
@@ -137,22 +140,38 @@ def authorize(session: Session, ticket: Ticket, state, reply: str, authorization
     return operations
 
 
-def _allowed_actions(op: DeliveryOperation) -> list[str]:
-    if op.state in ("pending", "unknown"):
+def _allowed_actions(op: DeliveryOperation, session: Session | None = None) -> list[str]:
+    if op.state in ("pending", "unknown") or (op.kind == "refund" and op.state == "succeeded"):
+        return ["reconcile"]
+    if op.state == "failed" and op.provider_id:
+        # A known rejected/bounced object cannot become a fresh send/refund intent.
         return ["reconcile"]
     if op.state in ("failed", "blocked") and (not op.retry_deadline or store.aware(op.retry_deadline) > store.now()):
-        return ["retry"] if op.error_code not in ("model_provenance_unverified", "recipient_not_approved", "fictional_seed_recipient", "payment_not_researched", "payment_binding_mismatch", "binding_unverified", "invalid_refund_money", "sender_changed") else []
+        if op.send_attempt_count >= MAX_ATTEMPTS:
+            return []
+        if op.error_code in ("model_provenance_unverified", "recipient_not_approved", "fictional_seed_recipient", "payment_not_researched", "payment_binding_mismatch", "binding_unverified", "invalid_refund_money", "sender_changed", "request_changed", "invalid_frozen_request"):
+            return []
+        if op.request_hash != store.fingerprint(op.request):
+            return []
+        if op.kind == "email":
+            if op.dependency_id:
+                dependency = session.get(DeliveryOperation, op.dependency_id) if session else None
+                if not dependency or dependency.state != "succeeded":
+                    return []
+            return [] if _email_block(op.request, session) else ["retry"]
+        ticket = session.get(Ticket, op.ticket_id) if session else None
+        return ["retry"] if ticket and not _refund_block(session, ticket, op.request) else []
     return []
 
 
-def serialize_operation(op: DeliveryOperation) -> dict:
+def serialize_operation(op: DeliveryOperation, session: Session | None = None) -> dict:
     return {
         "id": op.id, "kind": op.kind, "state": op.state, "provider_status": op.provider_status,
         "provider_id": op.provider_id, "amount_minor": op.request.get("amount_minor"),
         "currency": op.request.get("currency"), "test_mode": True,
         "recipient": op.request.get("to"), "updated_at": op.updated_at.isoformat(),
         "error_code": op.error_code, "error_message": op.error_message,
-        "allowed_actions": _allowed_actions(op),
+        "allowed_actions": _allowed_actions(op, session),
     }
 
 
@@ -161,10 +180,8 @@ def request_recovery(ticket_id: int, op_id: str, expected_version: int, action: 
         ticket, op = session.get(Ticket, ticket_id), session.get(DeliveryOperation, op_id)
         if not ticket or not op or op.ticket_id != ticket_id or ticket.current_run_id != op.run_id:
             raise ValueError("Operation not found on the current ticket run.")
-        if ticket.version != expected_version or action not in _allowed_actions(op):
+        if ticket.version != expected_version or action not in _allowed_actions(op, session):
             raise ValueError("Recovery is unavailable or the ticket changed. Refresh the ticket.")
-        if op.attempt_count >= MAX_ATTEMPTS:
-            raise ValueError("Automatic attempt limit reached. Manual investigation is required.")
         if action == "retry":
             error = _email_block(op.request, session) if op.kind == "email" else _refund_block(session, ticket, op.request)
             if error:
@@ -176,8 +193,11 @@ def request_recovery(ticket_id: int, op_id: str, expected_version: int, action: 
         if result.rowcount != 1:
             raise ValueError("Another action changed this ticket.")
         op.next_check_at = store.now()
+        op.manual_check_requested = action == "reconcile"
         if action == "retry":
             op.state = "queued"
+        elif op.state == "failed":
+            op.state = "unknown"
         op.version += 1
         op.updated_at = store.now()
         session.add(op)
@@ -223,15 +243,57 @@ def _refresh_ticket(session: Session, ticket: Ticket) -> None:
     session.add(ticket)
 
 
+def _reserve_send(operation_id: str, claim_token: str) -> bool:
+    """Persist the effect-attempt budget before a provider submission, not a read."""
+    with Session(engine) as session:
+        updated = session.exec(update(DeliveryOperation).where(
+            DeliveryOperation.id == operation_id, DeliveryOperation.claim_token == claim_token,
+            DeliveryOperation.state == "executing", DeliveryOperation.send_attempt_count < MAX_ATTEMPTS,
+        ).values(send_attempt_count=DeliveryOperation.send_attempt_count + 1))
+        if updated.rowcount != 1:
+            return False
+        session.exec(update(OperationAttempt).where(OperationAttempt.claim_token == claim_token).values(kind="send"))
+        session.commit()
+        return True
+
+
+async def _refund_submission(provider, request: dict, operation_id: str, token: str, key: str,
+                             deadline: dt.datetime, reconciling: bool):
+    from fulfillment.contracts import ProviderResult, RefundRequest
+
+    charge = await provider.inspect_charge(request["charge_id"])
+    valid = (charge.account_id == request["account_id"] == config.STRIPE_ACCOUNT_ID
+             and charge.customer_id == request["customer_id"] and charge.livemode is False
+             and charge.currency == request["currency"] == "usd"
+             and charge.amount_minor == request["amount_minor"] and charge.paid and charge.captured)
+    if not valid:
+        return ProviderResult("blocked", "blocked", error_code="provider_charge_mismatch", error_message="Provider charge does not match the verified test binding.")
+    refunds = await provider.list_refunds(request["charge_id"])
+    matches = [item for item in refunds if item.get("metadata", {}).get("relayy_operation_id") == operation_id
+               and item.get("amount") == request["amount_minor"] and item.get("currency") == "usd"
+               and item.get("charge_id") == request["charge_id"]]
+    if len(matches) == 1:
+        return await provider.retrieve(matches[0]["id"])
+    if matches or (reconciling and (charge.amount_refunded or store.now() >= deadline)):
+        return ProviderResult("unknown", "unknown", error_code="refund_reconciliation_required", error_message="Refund evidence is ambiguous or the safe retry window expired.")
+    if charge.amount_refunded or refunds:
+        return ProviderResult("blocked", "blocked", error_code="existing_refund", error_message="This charge already has a different refund or refund reservation.")
+    if store.now() >= deadline:
+        return ProviderResult("unknown", "unknown", error_code="idempotency_expired", error_message="The safe refund retry window expired. Investigate provider evidence.")
+    if not _reserve_send(operation_id, token):
+        return ProviderResult("unknown", "unknown", error_code="send_attempt_limit", error_message="The send attempt limit is reached. Read-only reconciliation remains available.")
+    return await provider.refund(RefundRequest(**{k: v for k, v in request.items() if k != "local_payment_id"}, operation_id=operation_id), key)
+
+
 async def process_operation(operation_id: str, email_provider=None, refund_provider=None) -> None:
     """Execute or reconcile one durable operation; adapters are injectable for tests."""
-    from fulfillment.contracts import EmailRequest, ProviderError, ProviderResult, RefundRequest
+    from fulfillment.contracts import EmailRequest, ProviderError, ProviderResult
     from integrations.resend import ResendAdapter
     from integrations.stripe import StripeAdapter
 
     with Session(engine) as session:
         op = session.get(DeliveryOperation, operation_id)
-        if not op or op.attempt_count >= MAX_ATTEMPTS or op.state not in ("queued", "pending", "unknown", "succeeded"):
+        if not op or op.state not in ("queued", "pending", "unknown", "succeeded"):
             return
         if op.state == "succeeded" and op.kind != "refund":
             return
@@ -244,7 +306,8 @@ async def process_operation(operation_id: str, email_provider=None, refund_provi
         ticket = session.get(Ticket, op.ticket_id)
         if not ticket or ticket.current_run_id != op.run_id:
             return
-        reconciling = op.state in ("pending", "unknown", "succeeded")
+        previous_state, previous_provider_status = op.state, op.provider_status
+        reconciling = op.state in ("pending", "unknown", "succeeded") or bool(op.provider_id)
         # Expired queued retries cannot become new POSTs after the retention window.
         expired = bool(op.retry_deadline and store.aware(op.retry_deadline) <= store.now())
         if op.state == "queued" and expired:
@@ -259,7 +322,10 @@ async def process_operation(operation_id: str, email_provider=None, refund_provi
         ticket_id, run_id = op.ticket_id, op.run_id
         deadline = store.aware(op.retry_deadline)
         first_attempt = op.attempt_count
-        blocked = _email_block(request, session) if kind == "email" else _refund_block(session, ticket, request)
+        # Reconciliation is a read of an already submitted intent, not a new authorization.
+        blocked = None if reconciling and provider_id else (
+            _email_block(request, session) if kind == "email" else _refund_block(session, ticket, request)
+        )
     owned = []
     try:
         if original_hash != store.fingerprint(request):
@@ -276,34 +342,17 @@ async def process_operation(operation_id: str, email_provider=None, refund_provi
                     result = await provider.retrieve(provider_id)
                 elif store.now() >= deadline:
                     result = ProviderResult("unknown", "unknown", error_code="idempotency_expired", error_message="The safe retry window expired. Do not resend; investigate provider evidence.")
+                elif not _reserve_send(operation_id, token):
+                    result = ProviderResult("unknown", "unknown", error_code="send_attempt_limit", error_message="The send attempt limit is reached. Read-only reconciliation remains available.")
                 else:
                     result = await provider.send(EmailRequest(**request), key)
             else:
-                # All money paths verify the configured account and exact captured test charge.
-                charge = await provider.inspect_charge(request["charge_id"])
-                valid = (charge.account_id == request["account_id"] == config.STRIPE_ACCOUNT_ID
-                         and charge.customer_id == request["customer_id"] and charge.livemode is False
-                         and charge.currency == request["currency"] == "usd"
-                         and charge.amount_minor == request["amount_minor"] and charge.paid and charge.captured)
-                if not valid:
-                    result = ProviderResult("blocked", "blocked", error_code="provider_charge_mismatch", error_message="Provider charge does not match the verified test binding.")
-                elif reconciling:
-                    if provider_id:
-                        result = await provider.retrieve(provider_id)
-                    else:
-                        refunds = await provider.list_refunds(request["charge_id"])
-                        matches = [r for r in refunds if r.get("metadata", {}).get("relayy_operation_id") == operation_id
-                                   and r.get("amount") == request["amount_minor"] and r.get("currency") == "usd"]
-                        if len(matches) == 1:
-                            result = await provider.retrieve(matches[0]["id"])
-                        elif matches or charge.amount_refunded or store.now() >= deadline:
-                            result = ProviderResult("unknown", "unknown", error_code="refund_reconciliation_required", error_message="Refund evidence is ambiguous or the safe retry window expired.")
-                        else:
-                            result = await provider.refund(RefundRequest(**{k: v for k, v in request.items() if k != "local_payment_id"}, operation_id=operation_id), key)
-                elif charge.amount_refunded != 0 or await provider.list_refunds(request["charge_id"]):
-                    result = ProviderResult("blocked", "blocked", error_code="existing_refund", error_message="This charge already has a refund or refund reservation.")
+                if reconciling and provider_id:
+                    # The adapter verifies the account and source charge. A config change
+                    # cannot revoke the fact that a refund already succeeded.
+                    result = await provider.retrieve(provider_id)
                 else:
-                    result = await provider.refund(RefundRequest(**{k: v for k, v in request.items() if k != "local_payment_id"}, operation_id=operation_id), key)
+                    result = await _refund_submission(provider, request, operation_id, token, key, deadline, reconciling)
     except ProviderError as exc:
         result = exc.result
     except ValueError:
@@ -324,11 +373,14 @@ async def process_operation(operation_id: str, email_provider=None, refund_provi
         if result.state in ("accepted", "succeeded") and not result_id:
             result = ProviderResult("unknown", "unknown", error_code="missing_provider_id", error_message="Provider success has no object identity.")
         op.state, op.provider_status, op.provider_id = result.state, result.provider_status, result_id
+        if previous_state == "succeeded" and result.state not in ("succeeded", "pending", "failed"):
+            op.state, op.provider_status = "succeeded", previous_provider_status
+            op.provider_id = provider_id
         op.error_code, op.error_message = result.error_code, result.error_message
         op.updated_at, op.claim_token, op.claim_expires_at = store.now(), None, None
         op.version += 1
         # Reconciliation is bounded and never immediate spin-polling.
-        op.next_check_at = store.now() + dt.timedelta(seconds=min(300, 5 * 2 ** first_attempt))
+        op.next_check_at = store.now() + dt.timedelta(seconds=min(300, 5 * 2 ** min(first_attempt, 6)))
         session.add(op)
         attempt = session.get(OperationAttempt, attempt_id)
         attempt.ended_at, attempt.result = store.now(), result.state
@@ -338,7 +390,7 @@ async def process_operation(operation_id: str, email_provider=None, refund_provi
         ticket = session.get(Ticket, ticket_id)
         _refresh_ticket(session, ticket)
         record = TicketEvent(ticket_id=ticket_id, run_id=run_id, kind="operation", timestamp=store.now(),
-                             data={"operation": serialize_operation(op), "version": ticket.version, "run_id": run_id})
+                             data={"operation": serialize_operation(op, session), "version": ticket.version, "run_id": run_id})
         session.add(record)
         session.commit()
         status, resolution = ticket.status, ticket.resolution
@@ -382,7 +434,10 @@ async def worker(stop: asyncio.Event) -> None:
             session.commit()
             ids = session.exec(select(DeliveryOperation.id).where(
                 DeliveryOperation.state.in_(["queued", "pending", "unknown", "succeeded"]),
-                DeliveryOperation.attempt_count < MAX_ATTEMPTS,
+                (DeliveryOperation.check_attempt_count < MAX_SCHEDULED_CHECKS) | DeliveryOperation.manual_check_requested,
+                (DeliveryOperation.dependency_id.is_(None)) | DeliveryOperation.dependency_id.in_(
+                    select(DeliveryOperation.id).where(DeliveryOperation.state == "succeeded")
+                ),
                 (DeliveryOperation.next_check_at.is_(None)) | (DeliveryOperation.next_check_at <= timestamp),
             ).order_by(DeliveryOperation.created_at).limit(10)).all()
         for identifier in ids:

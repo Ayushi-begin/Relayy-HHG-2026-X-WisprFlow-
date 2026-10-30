@@ -55,14 +55,20 @@ def _error_result(response: _Response) -> ProviderResult:
 
 
 def _created_refund_matches(data: dict[str, Any], request: RefundRequest) -> bool:
-    """Require the create response to prove it represents the frozen intent."""
+    """Require the create response to prove it represents the frozen intent.
+
+    Stripe Refund objects do not have a documented ``livemode`` property. Test
+    mode is established by the configured non-live credential/account and the
+    inspected source charge. If a response does include a true value, fail
+    closed rather than accepting an unexpected live-mode object.
+    """
     metadata = data.get("metadata")
     return (
         isinstance(data.get("id"), str)
         and data.get("charge") == request.charge_id
         and data.get("amount") == request.amount_minor
         and data.get("currency") == request.currency
-        and data.get("livemode") is False
+        and data.get("livemode") is not True
         and isinstance(metadata, dict)
         and metadata.get("relayy_operation_id") == request.operation_id
     )
@@ -72,7 +78,9 @@ def _status_result(data: dict[str, Any], headers: Mapping[str, str]) -> Provider
     provider_id = data.get("id")
     if not isinstance(provider_id, str) or not provider_id:
         return ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(headers), error_code="invalid_response", error_message="Provider response omitted the refund identifier")
-    if data.get("livemode") is not False:
+    # Refunds do not document this property, but an explicitly live object is
+    # always rejected if a future API response supplies it.
+    if data.get("livemode") is True:
         return ProviderResult("blocked", "live_mode_refund", provider_id=provider_id, request_id=_safe_request_id(headers), error_code="live_mode_refund", error_message="Live-mode Stripe objects are not permitted")
     status = data.get("status")
     if not isinstance(status, str):
@@ -261,6 +269,17 @@ class StripeAdapter:
         data = _safe_json(response)
         if not data:
             return ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned an invalid refund response")
+        if data.get("id") != provider_id:
+            return ProviderResult("unknown", "response_mismatch", request_id=_safe_request_id(response.headers), error_code="refund_response_mismatch", error_message="Stripe response did not verify the requested refund")
+        charge_id = data.get("charge")
+        if not isinstance(charge_id, str) or not charge_id:
+            return ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe refund response omitted the source charge")
+        try:
+            # This verifies the retrieved refund remains attached to a test
+            # charge in the configured account before exposing success.
+            await self.inspect_charge(charge_id)
+        except ProviderError as error:
+            return error.result
         return _status_result(data, response.headers)
 
     async def list_refunds(self, charge_id: str) -> list[dict[str, Any]]:
@@ -282,20 +301,36 @@ class StripeAdapter:
                 raise ProviderError(_error_result(response))
             payload = _safe_json(response)
             data = payload.get("data") if payload else None
+            has_more = payload.get("has_more") if payload else None
             if not isinstance(data, list):
                 raise ProviderError(ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned an invalid refunds response"))
+            if not isinstance(has_more, bool):
+                raise ProviderError(ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe refunds pagination state was invalid"))
             for item in data:
                 if not isinstance(item, dict):
-                    continue
+                    raise ProviderError(ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned an invalid refund record"))
                 refund_id = item.get("id")
                 amount = item.get("amount")
                 currency = item.get("currency")
                 status = item.get("status")
                 item_charge = item.get("charge")
-                if not all((isinstance(refund_id, str), isinstance(amount, int) and not isinstance(amount, bool), isinstance(currency, str), isinstance(status, str), isinstance(item_charge, str))):
-                    continue
+                if not all((
+                    isinstance(refund_id, str) and bool(refund_id),
+                    isinstance(amount, int) and not isinstance(amount, bool) and amount > 0,
+                    isinstance(currency, str) and len(currency) == 3 and currency.isalpha(),
+                    isinstance(status, str) and bool(status),
+                    isinstance(item_charge, str) and bool(item_charge),
+                )):
+                    raise ProviderError(ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned an incomplete refund record"))
                 raw_metadata = item.get("metadata")
-                metadata = {str(name)[:128]: str(value)[:512] for name, value in raw_metadata.items()} if isinstance(raw_metadata, dict) else {}
+                if raw_metadata is not None and not isinstance(raw_metadata, dict):
+                    raise ProviderError(ProviderResult("unknown", "invalid_response", request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned invalid refund metadata"))
+                item_livemode = item.get("livemode")
+                if item_livemode is True:
+                    raise ProviderError(ProviderResult("blocked", "live_mode_refund", provider_id=refund_id, request_id=_safe_request_id(response.headers), error_code="live_mode_refund", error_message="Live-mode Stripe objects are not permitted"))
+                if item_livemode is not None and not isinstance(item_livemode, bool):
+                    raise ProviderError(ProviderResult("unknown", "invalid_response", provider_id=refund_id, request_id=_safe_request_id(response.headers), error_code="invalid_response", error_message="Stripe returned an invalid refund mode"))
+                metadata = {str(name)[:128]: str(value)[:512] for name, value in (raw_metadata or {}).items()}
                 refunds.append({
                     "id": refund_id,
                     "charge_id": item_charge,
@@ -304,11 +339,10 @@ class StripeAdapter:
                     "currency": currency.lower(),
                     "status": status,
                     "metadata": metadata,
-                    "livemode": item.get("livemode") if isinstance(item.get("livemode"), bool) else None,
+                    "livemode": item_livemode,
                 })
                 if len(refunds) >= MAX_REFUNDS:
                     raise ProviderError(ProviderResult("unknown", "pagination_limit", error_code="pagination_limit", error_message="Stripe refunds exceeded the safety limit"))
-            has_more = payload.get("has_more") is True if payload else False
             if not has_more:
                 return refunds
             last_id = data[-1].get("id") if data and isinstance(data[-1], dict) else None

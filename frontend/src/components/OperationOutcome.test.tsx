@@ -42,6 +42,13 @@ const detail: TicketDetail = {
 afterEach(cleanup)
 
 describe('OperationOutcome', () => {
+  it('hides the operation panel when fulfillment was not requested', () => {
+    const notRequested: TicketDetail = { ...detail, fulfillment_state: 'not_requested', operations: [] }
+    const { container } = render(<OperationOutcome detail={notRequested} token="operator-token" onDetail={vi.fn()} />)
+
+    expect(container.innerHTML).toBe('')
+  })
+
   it('blocks duplicate refund language and uses only server-authorized reconciliation', () => {
     render(<OperationOutcome detail={detail} token="operator-token" onDetail={vi.fn()} />)
 
@@ -60,6 +67,28 @@ describe('OperationOutcome', () => {
 
     await vi.waitFor(() => expect(api.recoverOperation).toHaveBeenCalledWith(11, 'refund-1', 'reconcile', 4, 'operator-token'))
     expect(onDetail).toHaveBeenCalledWith(detail)
+  })
+
+  it('does not claim a refund for an email-only provider acceptance', () => {
+    const emailOnly: TicketDetail = {
+      ...detail,
+      operations: [{ ...detail.operations[1], state: 'accepted' }],
+    }
+    render(<OperationOutcome detail={emailOnly} token="operator-token" onDetail={vi.fn()} />)
+
+    expect(screen.getByText('Email accepted by provider')).not.toBeNull()
+    expect(screen.queryByText(/refund succeeded/i)).toBeNull()
+  })
+
+  it('keeps required follow-up visible after provider completion', () => {
+    const completed: TicketDetail = {
+      ...detail,
+      manual_followup_required: true,
+      operations: [{ ...detail.operations[0], state: 'succeeded', allowed_actions: [] }, { ...detail.operations[1], state: 'accepted' }],
+    }
+    render(<OperationOutcome detail={completed} token="operator-token" onDetail={vi.fn()} />)
+
+    expect(screen.getByText('Reply accepted; original issue still needs review.')).not.toBeNull()
   })
 
   it('preserves a succeeded refund and offers only email retry when the server permits it', () => {

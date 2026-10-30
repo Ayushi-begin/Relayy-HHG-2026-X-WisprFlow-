@@ -21,6 +21,6 @@ def require_operator(request: Request) -> str:
     if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
         raise HTTPException(415, "Use application/json.")
     provided = request.headers.get("authorization", "")
-    if not secrets.compare_digest(provided, f"Bearer {expected}"):
+    if not secrets.compare_digest(provided.encode("utf-8"), f"Bearer {expected}".encode("utf-8")):
         raise HTTPException(401, "Unlock the demo with the operator token.")
     return config.DEMO_OPERATOR_NAME

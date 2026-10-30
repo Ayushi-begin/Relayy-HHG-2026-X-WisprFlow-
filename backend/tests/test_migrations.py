@@ -41,3 +41,19 @@ def test_seed_refuses_reset_after_external_operation(monkeypatch):
         seed.seed(reset=True)
     with Session(engine) as session:
         assert session.get(DeliveryOperation, "op") is not None
+
+
+def test_version_two_adds_independent_budgets_without_changing_operations():
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    migrate(engine)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM schema_version WHERE version=2")
+        for column in ("send_attempt_count", "check_attempt_count", "manual_check_requested"):
+            conn.exec_driver_sql(f"ALTER TABLE delivery_operation DROP COLUMN {column}")
+        conn.exec_driver_sql("INSERT INTO delivery_operation (id,ticket_id,run_id,kind,provider,account_id,logical_key,request,request_hash,idempotency_key,state,attempt_count,version,created_at,updated_at) VALUES ('old',1,'run','refund','stripe','','refund:old','{}','hash','key','succeeded',6,3,'2026-10-29','2026-10-29')")
+    migrate(engine)
+    with Session(engine) as session:
+        op = session.get(DeliveryOperation, "old")
+        assert op.state == "succeeded" and op.attempt_count == 6 and op.version == 3
+        assert op.send_attempt_count == 6 and op.check_attempt_count == 0
+        assert not op.manual_check_requested
